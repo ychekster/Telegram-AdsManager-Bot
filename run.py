@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 
 from contextlib import suppress
 
-from app.bot.handlers import user
+from app.bot.handlers import routers
 from app.db.database import init_db, get_all_sessions
 from app.userbot.client import start_active_client, cleanup_pending_clients_loop
 
@@ -25,6 +25,7 @@ async def set_commands(bot: Bot):
         BotCommand(command='/cancel', description='Отмена команды'),
         BotCommand(command='/auth', description='Авторизация юзербота'),
         BotCommand(command='/numauth', description='Авторизация по номеру'),
+        BotCommand(command='/qrauth', description='Авторизация по QR-коду'),
         BotCommand(command='/deauth', description='Деавторизация юзербота'),
         BotCommand(command='/mychannels', description='Управление каналами'),
         BotCommand(command='/addchannel', description='Добавить канал'),
@@ -49,7 +50,8 @@ async def main():
               default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     
     dp = Dispatcher()
-    dp.include_router(user)
+    for router in routers:
+        dp.include_router(router)
     
     cleanup_task = asyncio.create_task(cleanup_pending_clients_loop()) # запускаем фоновую задачу для очистки истёкших клиентов
     

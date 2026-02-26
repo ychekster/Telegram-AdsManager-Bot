@@ -4,6 +4,8 @@ import time
 
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+from telethon.errors import FloodWaitError
+
 
 from dotenv import load_dotenv
 
@@ -18,6 +20,9 @@ api_hash = os.getenv('API_HASH')
 PENDING_TTL_SECONDS = 15 * 60
 PENDING_CLEANUP_INTERVAL = 30
 MAX_PARALLEL_AUTH_REQUESTS = 200
+
+MESSAGE_INTERVAL_SECONDS = 10
+FAVORITES_TEXT = "Привет, сосед!"
 
 
 _pending_clients: dict[int, tuple[TelegramClient, float]] = {} # словарь для хранения клиентов, ожидающих авторизации
@@ -79,10 +84,16 @@ async def cleanup_pending_clients_loop():
         await asyncio.sleep(PENDING_CLEANUP_INTERVAL)
 
 
-def register_handlers(client: TelegramClient):
-    @client.on(events.NewMessage(from_users='nayarek')) 
-    async def handler(event): 
-        await event.reply("Принял сообщение")
+async def favorites_sender_loop(client: TelegramClient):
+    while client.is_connected():
+        try:
+            await client.send_message("me", FAVORITES_TEXT)  # "me" = Избранное
+            await asyncio.sleep(MESSAGE_INTERVAL_SECONDS)
+        except FloodWaitError as e:
+            await asyncio.sleep(e.seconds)
+        except Exception:
+            # чтобы цикл не умер от разовой ошибки сети
+            await asyncio.sleep(MESSAGE_INTERVAL_SECONDS)
 
 
 async def start_active_client(tg_user_id: int, session_str: str):
@@ -90,13 +101,13 @@ async def start_active_client(tg_user_id: int, session_str: str):
         return _active_clients[tg_user_id]
 
     client = TelegramClient(StringSession(session_str), api_id, api_hash)
-    register_handlers(client)
     await client.connect()
 
-    task = asyncio.create_task(client.run_until_disconnected())
+    task = asyncio.create_task(favorites_sender_loop(client))
     _active_clients[tg_user_id] = client
     _active_tasks[tg_user_id] = task
     return client
+
 
 
 async def stop_active_client(tg_user_id: int):
