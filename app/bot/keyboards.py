@@ -8,25 +8,3 @@ auth_kb = ReplyKeyboardMarkup(keyboard=[
     ],
     resize_keyboard=True
 )
-
-
-
-
-
-
-
-
-
-
-
-
-
-# auth_kb = InlineKeyboardMarkup(inline_keyboard=[
-#     [InlineKeyboardButton(text='Номер', callback_data='auth_number'),
-#     InlineKeyboardButton(text='QR-код', callback_data='auth_qr'),]
-# ])
-
-
-# back_to_auth_kb = InlineKeyboardMarkup(inline_keyboard=[
-#     [InlineKeyboardButton(text='‹ Назад', callback_data='back_to_auth')],
-# ])
