@@ -2,20 +2,29 @@ import re
 
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, ReplyKeyboardRemove
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 
 from app.userbot.client import start_active_client
 from app.bot import keyboards as kb
 from app.bot.states import Auth
-from app.bot.handlers.auth_helpers import set_2fa_prompt_msg_id, delete_2fa_prompt_msg
-from app.db.database import add_user_if_not_exists, set_user_session
+from app.bot.handlers.auth_helpers import (
+    set_2fa_prompt_msg_id, 
+    delete_2fa_prompt_msg, 
+    is_userbot_already_authorized
+)
+from app.db.database import (
+    set_user_session,
+    get_user_session,
+    clear_user_session
+)
 from app.userbot.client import (
     create_client,
     get_client,
     delete_client,
     touch_client,
     get_auth_semaphore,
+    logout_userbot_session
 )
 
 from telethon.errors import (
@@ -33,6 +42,11 @@ auth_router = Router(name='auth')
 
 @auth_router.message(Command('auth'))
 async def cmd_auth(message: Message, state: FSMContext):
+    if await is_userbot_already_authorized(message.from_user.id):
+        await state.clear()
+        await message.answer('Юзер бот уже успешно авторизован.')
+        return
+
     try:
         await create_client(message.from_user.id) # создаём клиента и сохраняем его в словаре
     except Exception:
@@ -49,6 +63,11 @@ async def cmd_auth(message: Message, state: FSMContext):
 
 @auth_router.message(Command('numauth'))
 async def cmd_numauth(message: Message, state: FSMContext):
+    if await is_userbot_already_authorized(message.from_user.id):
+        await state.clear()
+        await message.answer('Юзер бот уже успешно авторизован.')
+        return
+    
     try:
         await create_client(message.from_user.id)
     except Exception:
@@ -226,7 +245,7 @@ async def auth_password(message: Message, state: FSMContext):
     except FloodWaitError as e:
         await delete_client(message.from_user.id)
         await state.clear()
-        await message.answer(f'Слишком много попыток. Подожди {e.seconds} сек. и начни заново: /auth')
+        await message.answer(f'Слишком много попыток. Подожди {e.seconds} секунд и начни заново: /auth')
         return
     except Exception:
         await delete_client(message.from_user.id)
@@ -249,3 +268,61 @@ async def auth_qr(message: Message, state: FSMContext):
     await message.answer('Авторизация по QR-коду пока не реализована. '
                          'Пожалуйста, выбери другой способ авторизации или отправь /cancel для отмены.',
                          reply_markup=kb.auth_kb)
+
+
+@auth_router.message(Command('deauth'))
+async def cmd_deauth(message: Message, state: FSMContext):
+    if not await is_userbot_already_authorized(message.from_user.id):
+        await message.answer(
+            'Деавторизация невозможна. В данный момент ты не авторизован. Отправь /auth для авторизации'
+        )
+        return
+
+    await message.answer(
+        'Ты уверен, что хочешь выйти?',
+        reply_markup=kb.deauth_confirm_kb
+    )
+
+
+@auth_router.callback_query(F.data == 'deauth_cancel')
+async def deauth_cancel(callback: CallbackQuery):
+    await callback.answer()
+    if callback.message:
+        await callback.message.edit_text('Выход из аккаунта отменён.')
+
+
+@auth_router.callback_query(F.data == 'deauth_confirm')
+async def deauth_confirm(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+
+    user_id = callback.from_user.id
+    
+    if not await is_userbot_already_authorized(user_id):
+        if callback.message:
+            await callback.message.edit_text(
+                'Деавторизация невозможна. В данный момент ты не авторизован. Отправь /auth для авторизации'
+            )
+        return
+
+    # на всякий случай: закрыть незавершённую auth-сессию
+    if callback.message:
+        await delete_2fa_prompt_msg(callback.message, state)
+    await delete_client(user_id)
+    await state.clear()
+
+    session_str = await get_user_session(user_id)
+    logout_ok = await logout_userbot_session(user_id, session_str)
+
+    if not logout_ok:
+        if callback.message:
+            await callback.message.edit_text(
+                'Не удалось выйти из аккаунта. Попробуйте позже.'
+            )
+        return
+
+    await clear_user_session(user_id)
+
+    if callback.message:
+        await callback.message.edit_text(
+            'Готово! Вы вышли из аккаунта. Для повторной авторизации отправьте /auth'
+        )

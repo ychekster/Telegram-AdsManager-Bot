@@ -56,3 +56,12 @@ async def get_all_sessions() -> list[tuple[int, str]]:
             "SELECT tg_id, session_str FROM users WHERE session_str IS NOT NULL"
         )
         return await cursor.fetchall()
+
+
+async def clear_user_session(tg_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            'UPDATE users SET session_str = NULL WHERE tg_id = ?',
+            (tg_id,)
+        )
+        await db.commit()

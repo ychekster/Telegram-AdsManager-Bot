@@ -1,30 +1,11 @@
-import re
-
-from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery, ReplyKeyboardRemove
+from aiogram import Router
+from aiogram.types import Message, ReplyKeyboardRemove
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 
-from app.bot import keyboards as kb
-from app.bot.states import Auth
 from app.bot.handlers.auth_helpers import delete_2fa_prompt_msg
-from app.db.database import add_user_if_not_exists, set_user_session
-from app.userbot.client import (
-    create_client,
-    get_client,
-    delete_client,
-    touch_client,
-    get_auth_semaphore,
-)
-
-from telethon.errors import (
-    SessionPasswordNeededError,
-    PhoneNumberInvalidError,
-    PhoneCodeInvalidError,
-    PhoneCodeExpiredError,
-    PasswordHashInvalidError,
-    FloodWaitError,
-)
+from app.db.database import add_user_if_not_exists
+from app.userbot.client import delete_client
 
 
 common_router = Router(name='common')
@@ -49,6 +30,8 @@ async def cmd_start(message: Message):
             '/deauth - деавторизация юзербота\n\n'
             '<b>Инструменты</b>\n'
             '/help - список команд\n'
+            '/numauth - авторизация по номеру\n'
+            '/qrauth - авторизация по QR-коду\n'
             '/cancel - отмена команды\n\n'
             # '/settings - настройки бота\n\n'
             '<b>Мои каналы</b>\n'
@@ -73,6 +56,8 @@ async def cmd_help(message: Message):
             '/deauth - деавторизация юзербота\n\n'
             '<b>Инструменты</b>\n'
             '/help - список команд\n'
+            '/numauth - авторизация по номеру\n'
+            '/qrauth - авторизация по QR-коду\n'
             '/cancel - отмена команды\n\n'
             # '/settings - настройки бота\n\n'
             '<b>Мои каналы</b>\n'

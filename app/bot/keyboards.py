@@ -8,3 +8,11 @@ auth_kb = ReplyKeyboardMarkup(keyboard=[
     ],
     resize_keyboard=True
 )
+
+
+deauth_confirm_kb = InlineKeyboardMarkup(inline_keyboard=[
+    [
+        InlineKeyboardButton(text='Отменить', callback_data='deauth_cancel'),
+        InlineKeyboardButton(text='Подтвердить', callback_data='deauth_confirm'),
+    ]
+])

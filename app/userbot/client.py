@@ -118,3 +118,41 @@ async def stop_active_client(tg_user_id: int):
         await client.disconnect() # отключаем клиента
     if task:
         task.cancel() # отменяем задачу
+
+
+async def logout_userbot_session(tg_user_id: int, session_str: str | None) -> bool:
+    # 1) Если активный клиент есть в памяти
+    client = _active_clients.pop(tg_user_id, None)
+    task = _active_tasks.pop(tg_user_id, None)
+
+    if task:
+        task.cancel()
+
+    if client:
+        try:
+            if not client.is_connected():
+                await client.connect()
+            await client.log_out()
+            return True
+        except Exception:
+            return False
+        finally:
+            if client.is_connected():
+                await client.disconnect()
+
+    # 2) Если активного клиента в памяти нет:
+    # если session_str пустая, считаем, что пользователь уже разлогинен (idempotent поведение)
+    if not session_str:
+        return True
+
+    # 3) Fallback: создаём временный клиент из session_str и делаем log_out()
+    temp_client = TelegramClient(StringSession(session_str), api_id, api_hash)
+    try:
+        await temp_client.connect()
+        await temp_client.log_out()
+        return True
+    except Exception:
+        return False
+    finally:
+        if temp_client.is_connected():
+            await temp_client.disconnect()
