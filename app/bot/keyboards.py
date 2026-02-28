@@ -1,10 +1,11 @@
+from app.bot.texts.keyboards_texts import *
 from aiogram.types import (InlineKeyboardMarkup, InlineKeyboardButton,
                            ReplyKeyboardMarkup, KeyboardButton)
 
 
 auth_kb = ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text='Номер'),
-        KeyboardButton(text='QR-код')],  
+        [KeyboardButton(text=AUTH_METHOD_NUMBER),
+        KeyboardButton(text=AUTH_METHOD_QR)],  
     ],
     resize_keyboard=True
 )
@@ -12,7 +13,7 @@ auth_kb = ReplyKeyboardMarkup(keyboard=[
 
 deauth_confirm_kb = InlineKeyboardMarkup(inline_keyboard=[
     [
-        InlineKeyboardButton(text='Отменить', callback_data='deauth_cancel'),
-        InlineKeyboardButton(text='Подтвердить', callback_data='deauth_confirm'),
+        InlineKeyboardButton(text=KB_CANCEL, callback_data='deauth_cancel'),
+        InlineKeyboardButton(text=KB_CONFIRM, callback_data='deauth_confirm'),
     ]
 ])

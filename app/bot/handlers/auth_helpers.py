@@ -7,6 +7,7 @@ from aiogram.fsm.context import FSMContext
 
 from telethon.errors import SessionPasswordNeededError, FloodWaitError
 
+from app.bot.texts.auth_texts import *
 from app.db.database import get_user_session, set_user_session
 from app.bot.states import Auth
 from app.userbot.client import (
@@ -45,7 +46,7 @@ async def finalize_auth_success(message: Message, state: FSMContext, client):
     await start_active_client(message.from_user.id, session_str)
     await delete_client(message.from_user.id)
     await state.clear()
-    await message.answer('Авторизация завершена.')
+    await message.answer(AUTH_SUCCESS)
 
 
 async def delete_qr_message(message: Message, state: FSMContext, qr_msg_id: int | None = None):
@@ -65,20 +66,20 @@ async def delete_qr_message(message: Message, state: FSMContext, qr_msg_id: int 
 async def start_qr_auth_flow(message: Message, state: FSMContext):
     if await is_userbot_already_authorized(message.from_user.id):
         await state.clear()
-        await message.answer('Юзер бот уже успешно авторизован.')
+        await message.answer(AUTH_ALREADY_AUTHORIZED)
         return
 
     try:
         await create_client(message.from_user.id)
     except Exception:
         await state.clear()
-        await message.answer('Не удалось начать авторизацию. Попробуй снова: /auth')
+        await message.answer(AUTH_START_FAILED)
         return
 
     client = await get_client(message.from_user.id)
     if not client:
         await state.clear()
-        await message.answer('Сессия авторизации истекла. Начни заново: /auth')
+        await message.answer(AUTH_SESSION_EXPIRED)
         return
 
     await state.set_state(Auth.scanning_qr)
@@ -95,7 +96,7 @@ async def start_qr_auth_flow(message: Message, state: FSMContext):
 
         qr_msg = await message.answer_photo(
             photo=qr_photo,
-            caption='Отсканируй QR-код с аккаунта телеграм, на котором хочешь авторизоваться',
+            caption=QR_CAPTION,
             reply_markup=ReplyKeyboardRemove(),
         )
         qr_msg_id = qr_msg.message_id
@@ -112,20 +113,20 @@ async def start_qr_auth_flow(message: Message, state: FSMContext):
         await delete_qr_message(message, state, qr_msg_id=qr_msg_id)
         await touch_client(message.from_user.id)
         await state.set_state(Auth.waiting_password)
-        prompt = await message.answer('Введи пароль от твоего аккаунта.')
+        prompt = await message.answer(AUTH_PASSWORD_PROMPT)
         await set_2fa_prompt_msg_id(state, prompt.message_id)
 
     except asyncio.TimeoutError:
         await delete_qr_message(message, state, qr_msg_id=qr_msg_id)
         await delete_client(message.from_user.id)
         await state.clear()
-        await message.answer('Время ожидания QR-кода истекло. Начни заново: /qrauth')
+        await message.answer(QR_TIMEOUT)
 
     except FloodWaitError as e:
         await delete_qr_message(message, state, qr_msg_id=qr_msg_id)
         await delete_client(message.from_user.id)
         await state.clear()
-        await message.answer(f'Слишком много попыток. Подожди {e.seconds} сек.')
+        await message.answer(AUTH_FLOOD_WAIT_SHORT.format(seconds=e.seconds))
 
     except Exception:
         await delete_qr_message(message, state, qr_msg_id=qr_msg_id)
@@ -135,4 +136,4 @@ async def start_qr_auth_flow(message: Message, state: FSMContext):
 
         await delete_client(message.from_user.id)
         await state.clear()
-        await message.answer('Ошибка авторизации. Начни заново: /auth')
+        await message.answer(AUTH_GENERIC_ERROR)
