@@ -5,4 +5,4 @@ class Auth(StatesGroup):
     waiting_phone = State()
     waiting_code = State()
     waiting_password = State()
-    qr = State()
+    scanning_qr = State()

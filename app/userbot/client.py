@@ -1,6 +1,7 @@
 import os
 import asyncio
 import time
+import binascii
 
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -23,6 +24,36 @@ MAX_PARALLEL_AUTH_REQUESTS = 200
 
 MESSAGE_INTERVAL_SECONDS = 10
 FAVORITES_TEXT = "Привет, сосед!"
+
+
+class InvalidStoredSessionError(Exception):
+    pass
+
+
+def _is_invalid_session_exception(exc: Exception) -> bool:
+    """
+    Возвращает True только для ошибок, которые с высокой вероятностью
+    означают, что сохранённая строка сессии действительно невалидна.
+    """
+    text = str(exc).lower().strip()
+
+    # Формат/декодинг строки сессии
+    if isinstance(exc, (ValueError, TypeError, binascii.Error)):
+        return True
+
+    # Точные маркеры, без общего "session"
+    markers = (
+        "not a valid string session",
+        "incorrect padding",
+        "invalid base64",
+        "auth key",
+        "key not found",
+        "user is deactivated",
+        "user deactivated",
+        "unregistered",
+    )
+
+    return any(marker in text for marker in markers)
 
 
 _pending_clients: dict[int, tuple[TelegramClient, float]] = {} # словарь для хранения клиентов, ожидающих авторизации
@@ -100,14 +131,42 @@ async def start_active_client(tg_user_id: int, session_str: str):
     if tg_user_id in _active_clients:
         return _active_clients[tg_user_id]
 
-    client = TelegramClient(StringSession(session_str), api_id, api_hash)
-    await client.connect()
+    try:
+        string_session = StringSession(session_str)
+    except Exception as e:
+        raise InvalidStoredSessionError(f"Invalid stored session format: {e}") from e
 
-    task = asyncio.create_task(favorites_sender_loop(client))
-    _active_clients[tg_user_id] = client
-    _active_tasks[tg_user_id] = task
-    return client
+    client = TelegramClient(string_session, api_id, api_hash)
 
+    try:
+        await client.connect()
+
+        if not await client.is_user_authorized():
+            raise InvalidStoredSessionError("Stored session is not authorized")
+
+        task = asyncio.create_task(favorites_sender_loop(client))
+        _active_clients[tg_user_id] = client
+        _active_tasks[tg_user_id] = task
+        return client
+
+    except InvalidStoredSessionError:
+        if client.is_connected():
+            await client.disconnect()
+        raise
+
+    except (OSError, asyncio.TimeoutError):
+        if client.is_connected():
+            await client.disconnect()
+        raise
+
+    except Exception as e:
+        if client.is_connected():
+            await client.disconnect()
+
+        if _is_invalid_session_exception(e):
+            raise InvalidStoredSessionError(f"Stored session is invalid: {e}") from e
+
+        raise
 
 
 async def stop_active_client(tg_user_id: int):

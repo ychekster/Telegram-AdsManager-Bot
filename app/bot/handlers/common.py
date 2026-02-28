@@ -14,6 +14,13 @@ common_router = Router(name='common')
 @common_router.message(Command('cancel'))
 async def cancel(message: Message, state: FSMContext):
     await delete_client(message.from_user.id)
+    data = await state.get_data()
+    qr_msg_id = data.get('qr_message_id')
+    if qr_msg_id:
+        try:
+            await message.bot.delete_message(chat_id=message.chat.id, message_id=qr_msg_id)
+        except Exception:
+            pass
     await delete_2fa_prompt_msg(message, state)
     await state.clear()
     await message.answer('Текущее действие отменено. Я больше ничего не ожидаю.\n\n'
@@ -29,10 +36,10 @@ async def cmd_start(message: Message):
             '/auth - авторизация юзербота\n'
             '/deauth - деавторизация юзербота\n\n'
             '<b>Инструменты</b>\n'
-            '/help - список команд\n'
             '/numauth - авторизация по номеру\n'
             '/qrauth - авторизация по QR-коду\n'
-            '/cancel - отмена команды\n\n'
+            '/cancel - отмена команды\n'
+            '/help - список команд\n\n'
             # '/settings - настройки бота\n\n'
             '<b>Мои каналы</b>\n'
             '/mychannels - управление каналами\n'
@@ -55,10 +62,10 @@ async def cmd_help(message: Message):
             '/auth - авторизация юзербота\n'
             '/deauth - деавторизация юзербота\n\n'
             '<b>Инструменты</b>\n'
-            '/help - список команд\n'
             '/numauth - авторизация по номеру\n'
             '/qrauth - авторизация по QR-коду\n'
-            '/cancel - отмена команды\n\n'
+            '/cancel - отмена команды\n'
+            '/help - список команд\n\n'
             # '/settings - настройки бота\n\n'
             '<b>Мои каналы</b>\n'
             '/mychannels - управление каналами\n'

@@ -9,9 +9,10 @@ from app.userbot.client import start_active_client
 from app.bot import keyboards as kb
 from app.bot.states import Auth
 from app.bot.handlers.auth_helpers import (
-    set_2fa_prompt_msg_id, 
-    delete_2fa_prompt_msg, 
-    is_userbot_already_authorized
+    set_2fa_prompt_msg_id,
+    delete_2fa_prompt_msg,
+    is_userbot_already_authorized,
+    start_qr_auth_flow,
 )
 from app.db.database import (
     set_user_session,
@@ -82,6 +83,11 @@ async def cmd_numauth(message: Message, state: FSMContext):
     )
 
 
+@auth_router.message(Command('qrauth'))
+async def cmd_qrauth(message: Message, state: FSMContext):
+    await start_qr_auth_flow(message, state)
+
+
 @auth_router.message(Auth.choosing_method)
 async def auth_state(message: Message, state: FSMContext):
     if message.text == 'Номер':
@@ -94,17 +100,17 @@ async def auth_state(message: Message, state: FSMContext):
         return
         
     if message.text == 'QR-код':
-        
-        await state.set_state(Auth.qr)
-        await message.answer('Авторизация по QR-коду. Отсканируй QR-код с аккаунта, который хочешь авторизовать, '
-                             'используя приложение Telegram на другом устройстве.',
-                             reply_markup=ReplyKeyboardRemove())
-        
+        await start_qr_auth_flow(message, state)
         return
         
     await message.answer(text='Отправь /cancel для отмены авторизации или выбери способ авторизации, '
                          'воспользовавшись клавиатурой ниже.',
                          reply_markup=kb.auth_kb)
+
+
+@auth_router.message(Auth.scanning_qr, ~F.text.startswith('/'))
+async def remind_scan_qr(message: Message):
+    await message.answer('Отсканируй QR-код выше.')
 
 
 @auth_router.message(Auth.waiting_phone)
@@ -260,14 +266,6 @@ async def auth_password(message: Message, state: FSMContext):
     await delete_client(message.from_user.id)
     await state.clear()
     await message.answer('Авторизация завершена.')
-
-
-@auth_router.message(Auth.qr)
-async def auth_qr(message: Message, state: FSMContext):
-    await state.set_state(Auth.choosing_method)
-    await message.answer('Авторизация по QR-коду пока не реализована. '
-                         'Пожалуйста, выбери другой способ авторизации или отправь /cancel для отмены.',
-                         reply_markup=kb.auth_kb)
 
 
 @auth_router.message(Command('deauth'))
