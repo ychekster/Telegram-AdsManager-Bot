@@ -36,6 +36,7 @@ async def set_commands(bot: Bot):
         BotCommand(command='/auth', description='Авторизация юзербота'),
         BotCommand(command='/numauth', description='Авторизация по номеру'),
         BotCommand(command='/qrauth', description='Авторизация по QR-коду'),
+        BotCommand(command='/settings', description='Настройки юзербота'),
         BotCommand(command='/deauth', description='Деавторизация юзербота'),
         BotCommand(command='/mychannels', description='Управление каналами'),
         BotCommand(command='/addchannel', description='Добавить канал'),

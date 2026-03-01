@@ -1,4 +1,4 @@
-from app.bot.handlers.common import common_router
+from app.bot.handlers.common_handlers import common_router
 from app.bot.handlers.auth_handlers import auth_router
 
 routers = (common_router, auth_router)
