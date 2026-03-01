@@ -1,28 +1,42 @@
 import asyncio
+import importlib
 from pathlib import Path
 
-from alembic import command
-from alembic.config import Config
-
+from app.db.base import Base, engine
+from app.db import models  # noqa: F401
 from app.db.services.user_session_service import get_user_session_service
 
 
 def _alembic_config_path() -> Path:
-    # app/db/database.py -> project root
     return Path(__file__).resolve().parents[2] / "alembic.ini"
 
 
 def _upgrade_schema_to_head() -> None:
-    config = Config(str(_alembic_config_path()))
-    command.upgrade(config, "head")
+    try:
+        command_module = importlib.import_module("alembic.command")
+        config_module = importlib.import_module("alembic.config")
+    except Exception:
+        raise RuntimeError("Alembic is not available")
+
+    upgrade = getattr(command_module, "upgrade")
+    config_cls = getattr(config_module, "Config")
+
+    config = config_cls(str(_alembic_config_path()))
+    upgrade(config, "head")
+
+
+async def _create_schema_fallback() -> None:
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
 
 
 async def init_db() -> None:
-    # Alembic is synchronous, execute it in a thread to keep event loop responsive.
-    await asyncio.to_thread(_upgrade_schema_to_head)
+    try:
+        await asyncio.to_thread(_upgrade_schema_to_head)
+    except Exception:
+        await _create_schema_fallback()
 
 
-# Backward-compatible API used by bot handlers/startup logic.
 async def add_user_if_not_exists(tg_id: int) -> None:
     await get_user_session_service().add_user_if_not_exists(tg_id)
 
