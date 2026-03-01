@@ -1,67 +1,43 @@
-import aiosqlite
-from datetime import datetime
+import asyncio
+from pathlib import Path
+
+from alembic import command
+from alembic.config import Config
+
+from app.db.services.user_session_service import get_user_session_service
 
 
-DB_PATH = 'database.db'
+def _alembic_config_path() -> Path:
+    # app/db/database.py -> project root
+    return Path(__file__).resolve().parents[2] / "alembic.ini"
 
 
-async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                tg_id INTEGER PRIMARY KEY,
-                registered_at TEXT NOT NULL,
-                session_str TEXT
-            )
-        ''')
-        await db.commit()
+def _upgrade_schema_to_head() -> None:
+    config = Config(str(_alembic_config_path()))
+    command.upgrade(config, "head")
 
 
-async def add_user_if_not_exists(tg_id: int): # добавляем пользователя в БД, если его там нет
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute('SELECT tg_id FROM users WHERE tg_id = ?', (tg_id,)) # проверяем, есть ли уже пользователь с таким tg_id
-        exists = await cursor.fetchone() # получаем результат запроса (будет None, если пользователь не найден)
-        if exists:
-            return
-        
-        registered_at = datetime.now().isoformat() # сохраняем время регистрации в ISO формате (московское время)
-        await db.execute(
-            'INSERT INTO users (tg_id, registered_at, session_str) VALUES (?, ?, ?)', 
-            (tg_id, registered_at, None)
-        ) 
-        await db.commit()
+async def init_db() -> None:
+    # Alembic is synchronous, execute it in a thread to keep event loop responsive.
+    await asyncio.to_thread(_upgrade_schema_to_head)
 
 
-async def set_user_session(tg_id: int, session_str: str): # сохраняем строку сессии в БД для пользователя с данным tg_id
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            'UPDATE users SET session_str = ? WHERE tg_id = ?', 
-            (session_str, tg_id)
-        )
-        await db.commit()
+# Backward-compatible API used by bot handlers/startup logic.
+async def add_user_if_not_exists(tg_id: int) -> None:
+    await get_user_session_service().add_user_if_not_exists(tg_id)
+
+
+async def set_user_session(tg_id: int, session_str: str) -> None:
+    await get_user_session_service().set_user_session(tg_id, session_str)
 
 
 async def get_user_session(tg_id: int) -> str | None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            'SELECT session_str FROM users WHERE tg_id = ?', (tg_id,)
-        )
-        result = await cursor.fetchone()
-        return result[0] if result else None
-    
+    return await get_user_session_service().get_user_session(tg_id)
+
 
 async def get_all_sessions() -> list[tuple[int, str]]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "SELECT tg_id, session_str FROM users WHERE session_str IS NOT NULL"
-        )
-        return await cursor.fetchall()
+    return await get_user_session_service().get_all_sessions()
 
 
-async def clear_user_session(tg_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            'UPDATE users SET session_str = NULL WHERE tg_id = ?',
-            (tg_id,)
-        )
-        await db.commit()
+async def clear_user_session(tg_id: int) -> None:
+    await get_user_session_service().clear_user_session(tg_id)

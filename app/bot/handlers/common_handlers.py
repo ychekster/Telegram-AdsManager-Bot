@@ -1,29 +1,30 @@
 from aiogram import Router
-from aiogram.types import Message, ReplyKeyboardRemove
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
+from aiogram.types import Message, ReplyKeyboardRemove
 
 from app.bot.handlers.auth_helpers import delete_2fa_prompt_msg, is_userbot_already_authorized
-from app.db.database import add_user_if_not_exists, get_user_session, clear_user_session
-from app.userbot.client import delete_client, start_active_client, InvalidStoredSessionError
 from app.bot.handlers.common_helpers import safe_html
 from app.bot.texts.common_texts import (
     CANCEL_TEXT,
     HELP_TEXT,
-    SETTINGS_UNAVAILABLE,
     SETTINGS_LOAD_FAILED,
     SETTINGS_TEXT,
+    SETTINGS_UNAVAILABLE,
 )
+from app.db.services import get_user_session_service
+from app.userbot.client import InvalidStoredSessionError, delete_client, start_active_client
 
 
-common_router = Router(name='common')
+common_router = Router(name="common")
+user_session_service = get_user_session_service()
 
 
-@common_router.message(Command('cancel'))
+@common_router.message(Command("cancel"))
 async def cancel(message: Message, state: FSMContext):
     await delete_client(message.from_user.id)
     data = await state.get_data()
-    qr_msg_id = data.get('qr_message_id')
+    qr_msg_id = data.get("qr_message_id")
     if qr_msg_id:
         try:
             await message.bot.delete_message(chat_id=message.chat.id, message_id=qr_msg_id)
@@ -36,16 +37,16 @@ async def cancel(message: Message, state: FSMContext):
 
 @common_router.message(CommandStart())
 async def cmd_start(message: Message):
-    await add_user_if_not_exists(message.from_user.id) # добавляем пользователя в БД, если его там нет
+    await user_session_service.add_user_if_not_exists(message.from_user.id)
     await message.answer(HELP_TEXT)
 
 
-@common_router.message(Command('help'))
+@common_router.message(Command("help"))
 async def cmd_help(message: Message):
     await message.answer(HELP_TEXT)
 
 
-@common_router.message(Command('settings'))
+@common_router.message(Command("settings"))
 async def cmd_settings(message: Message):
     user_id = message.from_user.id
 
@@ -53,14 +54,13 @@ async def cmd_settings(message: Message):
         await message.answer(SETTINGS_UNAVAILABLE)
         return
 
-    session_str = await get_user_session(user_id)
+    session_str = await user_session_service.get_user_session(user_id)
 
     try:
         client = await start_active_client(user_id, session_str)
         me = await client.get_me()
     except InvalidStoredSessionError:
-        # Сессия в БД есть, но фактически невалидна -> очищаем и показываем сообщение 'не авторизован'
-        await clear_user_session(user_id)
+        await user_session_service.clear_user_session(user_id)
         await message.answer(SETTINGS_UNAVAILABLE)
         return
     except Exception:
@@ -71,8 +71,8 @@ async def cmd_settings(message: Message):
         await message.answer(SETTINGS_LOAD_FAILED)
         return
 
-    username = f'@{me.username}' if me.username else 'не указано'
-    premium = 'да' if getattr(me, 'premium', False) else 'нет'
+    username = f"@{me.username}" if me.username else "не указано"
+    premium = "да" if getattr(me, "premium", False) else "нет"
 
     text = SETTINGS_TEXT.format(
         id=safe_html(me.id),

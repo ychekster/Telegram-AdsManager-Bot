@@ -8,7 +8,7 @@ from aiogram.fsm.context import FSMContext
 from telethon.errors import SessionPasswordNeededError, FloodWaitError
 
 from app.bot.texts.auth_texts import *
-from app.db.database import get_user_session, set_user_session
+from app.db.services import get_user_session_service
 from app.bot.states import Auth
 from app.userbot.client import (
     create_client,
@@ -18,6 +18,8 @@ from app.userbot.client import (
     get_auth_semaphore,
     start_active_client,
 )
+
+user_session_service = get_user_session_service()
 
 
 async def set_2fa_prompt_msg_id(state: FSMContext, message_id: int | None):
@@ -36,13 +38,13 @@ async def delete_2fa_prompt_msg(message: Message, state: FSMContext):
 
 
 async def is_userbot_already_authorized(tg_user_id: int) -> bool:
-    session_str = await get_user_session(tg_user_id)
+    session_str = await user_session_service.get_user_session(tg_user_id)
     return bool(session_str and session_str.strip())
 
 
 async def finalize_auth_success(message: Message, state: FSMContext, client):
     session_str = client.session.save()
-    await set_user_session(message.from_user.id, session_str)
+    await user_session_service.set_user_session(message.from_user.id, session_str)
     await start_active_client(message.from_user.id, session_str)
     await delete_client(message.from_user.id)
     await state.clear()

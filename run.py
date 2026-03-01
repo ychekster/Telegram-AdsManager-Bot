@@ -12,7 +12,8 @@ from dotenv import load_dotenv
 from contextlib import suppress
 
 from app.bot.handlers import routers
-from app.db.database import init_db, get_all_sessions, clear_user_session
+from app.db.database import init_db
+from app.db.services import get_user_session_service
 from app.userbot.client import (
     start_active_client,
     cleanup_pending_clients_loop,
@@ -78,7 +79,8 @@ async def set_commands_with_retry(
 async def restore_active_clients_on_startup(
     concurrency: int = RESTORE_CONCURRENCY,
 ):
-    sessions = await get_all_sessions()
+    user_session_service = get_user_session_service()
+    sessions = await user_session_service.get_all_sessions()
     sessions = [(tg_id, s) for tg_id, s in sessions if s and s.strip()]
 
     sem = asyncio.Semaphore(concurrency)
@@ -116,7 +118,7 @@ async def restore_one_session(
             return "restored"
 
         except InvalidStoredSessionError as e:
-            await clear_user_session(tg_id)
+            await get_user_session_service().clear_user_session(tg_id)
             print(f"[startup] Cleared invalid session for user {tg_id}: {e}")
             return "cleared"
 

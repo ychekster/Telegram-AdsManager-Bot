@@ -16,11 +16,7 @@ from app.bot.handlers.auth_helpers import (
     is_userbot_already_authorized,
     start_qr_auth_flow,
 )
-from app.db.database import (
-    set_user_session,
-    get_user_session,
-    clear_user_session
-)
+from app.db.services import get_user_session_service
 from app.userbot.client import (
     create_client,
     get_client,
@@ -41,6 +37,7 @@ from telethon.errors import (
 
 
 auth_router = Router(name='auth')
+user_session_service = get_user_session_service()
 
 
 @auth_router.message(Command('auth'))
@@ -202,7 +199,7 @@ async def auth_code(message: Message, state: FSMContext):
         return
 
     session_str = client.session.save()
-    await set_user_session(message.from_user.id, session_str)
+    await user_session_service.set_user_session(message.from_user.id, session_str)
     await start_active_client(message.from_user.id, session_str)
 
     await delete_client(message.from_user.id)
@@ -258,7 +255,7 @@ async def auth_password(message: Message, state: FSMContext):
         return
 
     session_str = client.session.save()
-    await set_user_session(message.from_user.id, session_str)
+    await user_session_service.set_user_session(message.from_user.id, session_str)
     await start_active_client(message.from_user.id, session_str)
 
     await delete_client(message.from_user.id)
@@ -299,7 +296,7 @@ async def deauth_confirm(callback: CallbackQuery, state: FSMContext):
     await delete_client(user_id)
     await state.clear()
 
-    session_str = await get_user_session(user_id)
+    session_str = await user_session_service.get_user_session(user_id)
     logout_ok = await logout_userbot_session(user_id, session_str)
 
     if not logout_ok:
@@ -307,7 +304,7 @@ async def deauth_confirm(callback: CallbackQuery, state: FSMContext):
             await callback.message.edit_text(DEAUTH_FAILED)
         return
 
-    await clear_user_session(user_id)
+    await user_session_service.clear_user_session(user_id)
 
     if callback.message:
         await callback.message.edit_text(DEAUTH_DONE)
