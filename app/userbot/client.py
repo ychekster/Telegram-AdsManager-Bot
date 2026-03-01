@@ -1,29 +1,26 @@
-import os
 import asyncio
-import time
 import binascii
+import logging
+import os
+import time
 
-from telethon import TelegramClient, events
+from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.errors import FloodWaitError
-
 
 from dotenv import load_dotenv
 
 
-load_dotenv('.env') # загружаем переменные окружения из .env файла
-
+load_dotenv(".env")
 
 # Use your own values from my.telegram.org
-api_id = os.getenv('API_ID')
-api_hash = os.getenv('API_HASH')
+api_id = os.getenv("API_ID")
+api_hash = os.getenv("API_HASH")
 
 PENDING_TTL_SECONDS = 15 * 60
 PENDING_CLEANUP_INTERVAL = 30
 MAX_PARALLEL_AUTH_REQUESTS = 200
 
-MESSAGE_INTERVAL_SECONDS = 10
-FAVORITES_TEXT = "Привет, сосед!"
+logger = logging.getLogger(__name__)
 
 
 class InvalidStoredSessionError(Exception):
@@ -31,17 +28,13 @@ class InvalidStoredSessionError(Exception):
 
 
 def _is_invalid_session_exception(exc: Exception) -> bool:
-    """
-    Возвращает True только для ошибок, которые с высокой вероятностью
-    означают, что сохранённая строка сессии действительно невалидна.
-    """
+    """Return True only for errors that indicate an invalid saved session string."""
     text = str(exc).lower().strip()
 
-    # Формат/декодинг строки сессии
+    # Session string format/decoding errors.
     if isinstance(exc, (ValueError, TypeError, binascii.Error)):
         return True
 
-    # Точные маркеры, без общего "session"
     markers = (
         "not a valid string session",
         "incorrect padding",
@@ -56,11 +49,10 @@ def _is_invalid_session_exception(exc: Exception) -> bool:
     return any(marker in text for marker in markers)
 
 
-_pending_clients: dict[int, tuple[TelegramClient, float]] = {} # словарь для хранения клиентов, ожидающих авторизации
-_auth_semaphore = asyncio.Semaphore(MAX_PARALLEL_AUTH_REQUESTS) # семафор для ограничения количества параллельных запросов авторизации
+_pending_clients: dict[int, tuple[TelegramClient, float]] = {}
+_auth_semaphore = asyncio.Semaphore(MAX_PARALLEL_AUTH_REQUESTS)
 
-_active_clients: dict[int, TelegramClient] = {} # словарь для хранения авторизованных клиентов
-_active_tasks: dict[int, asyncio.Task] = {} # словарь для хранения задач, связанных с клиентами (например, прослушивание сообщений)
+_active_clients: dict[int, TelegramClient] = {}
 
 
 def get_auth_semaphore() -> asyncio.Semaphore:
@@ -68,11 +60,12 @@ def get_auth_semaphore() -> asyncio.Semaphore:
 
 
 async def create_client(user_id: int) -> TelegramClient:
-    await delete_client(user_id) # удаляем старый клиент, если он есть (на случай повторной авторизации)
-    
-    client = TelegramClient(StringSession(), api_id, api_hash) # создаём клиента с пустой сессией
+    await delete_client(user_id)
+
+    client = TelegramClient(StringSession(), api_id, api_hash)
     await client.connect()
-    _pending_clients[user_id] = (client, time.monotonic() + PENDING_TTL_SECONDS) # сохраняем клиента в словаре
+    _pending_clients[user_id] = (client, time.monotonic() + PENDING_TTL_SECONDS)
+    logger.info("Created pending userbot client for user %s", user_id)
     return client
 
 
@@ -80,13 +73,13 @@ async def get_client(user_id: int) -> TelegramClient | None:
     item = _pending_clients.get(user_id)
     if not item:
         return None
-    
+
     client, expiry_at = item
     if time.monotonic() >= expiry_at:
         await delete_client(user_id)
         return None
-    
-    return client # получаем клиента из словаря
+
+    return client
 
 
 async def touch_client(user_id: int):
@@ -104,6 +97,7 @@ async def delete_client(user_id: int):
     client, _ = item
     if client.is_connected():
         await client.disconnect()
+    logger.info("Deleted pending userbot client for user %s", user_id)
 
 
 async def cleanup_pending_clients_loop():
@@ -112,29 +106,20 @@ async def cleanup_pending_clients_loop():
         expired_ids = [uid for uid, (_, exp) in _pending_clients.items() if exp <= now]
         for uid in expired_ids:
             await delete_client(uid)
+        if expired_ids:
+            logger.info("Cleaned up %s expired pending clients", len(expired_ids))
         await asyncio.sleep(PENDING_CLEANUP_INTERVAL)
-
-
-async def favorites_sender_loop(client: TelegramClient):
-    while client.is_connected():
-        try:
-            await client.send_message("me", FAVORITES_TEXT)  # "me" = Избранное
-            await asyncio.sleep(MESSAGE_INTERVAL_SECONDS)
-        except FloodWaitError as e:
-            await asyncio.sleep(e.seconds)
-        except Exception:
-            # чтобы цикл не умер от разовой ошибки сети
-            await asyncio.sleep(MESSAGE_INTERVAL_SECONDS)
 
 
 async def start_active_client(tg_user_id: int, session_str: str):
     if tg_user_id in _active_clients:
+        logger.debug("Active client already running for user %s", tg_user_id)
         return _active_clients[tg_user_id]
 
     try:
         string_session = StringSession(session_str)
-    except Exception as e:
-        raise InvalidStoredSessionError(f"Invalid stored session format: {e}") from e
+    except Exception as exc:
+        raise InvalidStoredSessionError(f"Invalid stored session format: {exc}") from exc
 
     client = TelegramClient(string_session, api_id, api_hash)
 
@@ -144,9 +129,8 @@ async def start_active_client(tg_user_id: int, session_str: str):
         if not await client.is_user_authorized():
             raise InvalidStoredSessionError("Stored session is not authorized")
 
-        task = asyncio.create_task(favorites_sender_loop(client))
         _active_clients[tg_user_id] = client
-        _active_tasks[tg_user_id] = task
+        logger.info("Started active userbot client for user %s", tg_user_id)
         return client
 
     except InvalidStoredSessionError:
@@ -159,58 +143,55 @@ async def start_active_client(tg_user_id: int, session_str: str):
             await client.disconnect()
         raise
 
-    except Exception as e:
+    except Exception as exc:
         if client.is_connected():
             await client.disconnect()
 
-        if _is_invalid_session_exception(e):
-            raise InvalidStoredSessionError(f"Stored session is invalid: {e}") from e
+        if _is_invalid_session_exception(exc):
+            raise InvalidStoredSessionError(f"Stored session is invalid: {exc}") from exc
 
         raise
 
 
 async def stop_active_client(tg_user_id: int):
-    client = _active_clients.pop(tg_user_id, None) # удаляем клиента из словаря
-    task = _active_tasks.pop(tg_user_id, None) # удаляем задачу из словаря
-    
+    client = _active_clients.pop(tg_user_id, None)
+
     if client:
-        await client.disconnect() # отключаем клиента
-    if task:
-        task.cancel() # отменяем задачу
+        await client.disconnect()
+        logger.info("Stopped active userbot client for user %s", tg_user_id)
 
 
 async def logout_userbot_session(tg_user_id: int, session_str: str | None) -> bool:
-    # 1) Если активный клиент есть в памяти
+    # 1) Use active in-memory client if available.
     client = _active_clients.pop(tg_user_id, None)
-    task = _active_tasks.pop(tg_user_id, None)
-
-    if task:
-        task.cancel()
 
     if client:
         try:
             if not client.is_connected():
                 await client.connect()
             await client.log_out()
+            logger.info("Logged out active userbot session for user %s", tg_user_id)
             return True
         except Exception:
+            logger.exception("Failed to logout active userbot session for user %s", tg_user_id)
             return False
         finally:
             if client.is_connected():
                 await client.disconnect()
 
-    # 2) Если активного клиента в памяти нет:
-    # если session_str пустая, считаем, что пользователь уже разлогинен (idempotent поведение)
+    # 2) If no in-memory client and no session string, treat as already logged out.
     if not session_str:
         return True
 
-    # 3) Fallback: создаём временный клиент из session_str и делаем log_out()
+    # 3) Fallback: temporary client created from stored session string.
     temp_client = TelegramClient(StringSession(session_str), api_id, api_hash)
     try:
         await temp_client.connect()
         await temp_client.log_out()
+        logger.info("Logged out userbot session via temporary client for user %s", tg_user_id)
         return True
     except Exception:
+        logger.exception("Failed to logout userbot session via temporary client for user %s", tg_user_id)
         return False
     finally:
         if temp_client.is_connected():

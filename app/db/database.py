@@ -1,10 +1,15 @@
 import asyncio
 import importlib
+import logging
 from pathlib import Path
+
+from sqlalchemy import text
 
 from app.db.base import Base, engine
 from app.db import models  # noqa: F401
 from app.db.services.user_session_service import get_user_session_service
+
+logger = logging.getLogger(__name__)
 
 
 def _alembic_config_path() -> Path:
@@ -30,11 +35,81 @@ async def _create_schema_fallback() -> None:
         await connection.run_sync(Base.metadata.create_all)
 
 
+async def _ensure_monitored_channels_compat() -> None:
+    async with engine.begin() as connection:
+        dialect = connection.dialect.name
+
+        if dialect == "sqlite":
+            table_exists = await connection.execute(
+                text("SELECT name FROM sqlite_master WHERE type='table' AND name='monitored_channels'")
+            )
+            if table_exists.first() is None:
+                return
+
+            cols_result = await connection.execute(text("PRAGMA table_info(monitored_channels)"))
+            cols = {row[1] for row in cols_result.fetchall()}
+
+            if "channel_id" not in cols:
+                await connection.execute(text("ALTER TABLE monitored_channels ADD COLUMN channel_id BIGINT"))
+            if "access_hash" not in cols:
+                await connection.execute(text("ALTER TABLE monitored_channels ADD COLUMN access_hash BIGINT"))
+            if "channel_title" not in cols:
+                await connection.execute(text("ALTER TABLE monitored_channels ADD COLUMN channel_title TEXT"))
+
+            await connection.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_monitored_channels_channel_id "
+                    "ON monitored_channels(channel_id)"
+                )
+            )
+            await connection.commit()
+            return
+
+        table_exists = await connection.execute(
+            text(
+                "SELECT 1 FROM information_schema.tables "
+                "WHERE table_name='monitored_channels'"
+            )
+        )
+        if table_exists.first() is None:
+            return
+
+        cols_result = await connection.execute(
+            text(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name='monitored_channels'"
+            )
+        )
+        cols = {row[0] for row in cols_result.fetchall()}
+
+        if "channel_id" not in cols:
+            await connection.execute(text("ALTER TABLE monitored_channels ADD COLUMN channel_id BIGINT"))
+        if "access_hash" not in cols:
+            await connection.execute(text("ALTER TABLE monitored_channels ADD COLUMN access_hash BIGINT"))
+        if "channel_title" not in cols:
+            await connection.execute(text("ALTER TABLE monitored_channels ADD COLUMN channel_title TEXT"))
+
+        await connection.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_monitored_channels_channel_id ON monitored_channels(channel_id)")
+        )
+        await connection.commit()
+
+
 async def init_db() -> None:
     try:
+        logger.info("Applying database migrations to head")
         await asyncio.to_thread(_upgrade_schema_to_head)
+        logger.info("Database migrations applied")
     except Exception:
+        logger.exception("Alembic upgrade failed; fallback to create_all")
         await _create_schema_fallback()
+        logger.info("Database schema created via fallback")
+
+    try:
+        await _ensure_monitored_channels_compat()
+        logger.info("Database compatibility checks applied")
+    except Exception:
+        logger.exception("Failed database compatibility checks")
 
 
 async def add_user_if_not_exists(tg_id: int) -> None:

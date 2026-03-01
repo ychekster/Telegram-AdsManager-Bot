@@ -14,11 +14,15 @@ HELP_TEXT = (
     '/settings - настройки юзербота\n'
     '/cancel - отмена команды\n'
     '/help - список команд\n\n'
+    '<b>Мониторинг каналов</b>\n'
+    '/monitors - отслеживаемые каналы\n'
+    '/addmonitor - добавить монитор\n'
+    '/delmonitor - удалить монитор\n\n'
     '<b>Мои каналы</b>\n'
     '/mychannels - управление каналами\n'
     '/addchannel - добавить канал\n'
     '/delchannel - удалить канал\n\n'
-    '<b>Все каналы</b>\n'
+    '<b>Каналы рекламодателей</b>\n'
     '/channels - каналы рекламодателей\n'
     '/banned - заблокированные каналы\n'
     '/muted - замьюченные каналы\n'
@@ -45,3 +49,80 @@ SETTINGS_TEXT = (
     "Телефон: {phone}\n"
     "Premium: {premium}"
 )
+
+MONITOR_UNAVAILABLE = (
+    "Команда /addmonitor недоступна. Сначала авторизуй юзербота через /auth."
+)
+
+MONITOR_PROMPT = (
+    "Отправь одну или несколько ссылок на каналы, которые хочешь добавить.\n\n"
+    "Отправь /cancel для отмены."
+)
+
+MONITOR_PROMPT_MORE = "Отправь одну или несколько ссылок на каналы, которые также хочешь добавить."
+
+MONITOR_SAVE_QUESTION = "Сохранить каналы?"
+
+MONITOR_NO_VALID_LINKS = (
+    "Не нашёл валидные ссылки на каналы. Отправь ссылки в формате @username, "
+    "t.me/username, https://t.me/username, t.me/+invite или https://t.me/+invite."
+)
+
+MONITOR_SAVED_TEMPLATE = (
+    "Сохранённые каналы:\n\n{links}\n\n"
+    "Отправь /help для получения списка команд."
+)
+
+MONITORS_EMPTY = (
+    "Увы, у тебя пока нет ни одного отслеживаемого канала.\n\n"
+    "Отправь /addmonitor для добавления монитора."
+)
+
+MONITORS_PICK = "Выбери монитор."
+
+MONITOR_INFO_TEMPLATE = (
+    "<b>Монитор канала</b>\n\n"
+    "Ссылка: {link}\n"
+    "Добавлен: {created_at}\n"
+    "ID: <code>{monitor_id}</code>"
+)
+
+MONITOR_NOT_FOUND = "Монитор не найден или уже удалён."
+
+MONITOR_RESOLVE_FAILED = (
+    "Не удалось получить данные хотя бы по одному каналу. "
+    "Проверь, что аккаунт юзербота состоит в канале, и попробуй снова."
+)
+
+MONITOR_INFO_DETAILS_TEMPLATE = (
+    "<b>Монитор канала</b>\n\n"
+    "Название: {channel_title}\n"
+    "ID канала: <code>{channel_id}</code>\n"
+    "Ссылка добавления: {channel_link}"
+)
+
+MONITOR_FLOW_EXPIRED = (
+    "Сессия добавления мониторов истекла.\n\n"
+    "Отправь /addmonitor и попробуй снова."
+)
+
+MONITORS_LOAD_FAILED = "Не удалось загрузить список мониторов. Попробуй ещё раз через пару секунд."
+
+DELMONITOR_PICK = "Выбери один или несколько мониторов, которые хочешь удалить."
+
+DELMONITOR_DONE = (
+    "Готово! Все выбранные каналы удалены.\n\n"
+    "Отправь /help для получения списка команд."
+)
+
+DELMONITOR_NOT_SELECTED = "Выбери хотя бы один монитор."
+
+MONITOR_DELETE_CONFIRM = "Подтвердить удаление."
+MONITOR_DELETED = "Монитор удалён."
+
+DELMONITOR_FLOW_EXPIRED = (
+    "Сессия удаления мониторов истекла.\n\n"
+    "Отправь /delmonitor и попробуй снова."
+)
+
+PAGINATION_END_HINT = "Дальше страниц нет."

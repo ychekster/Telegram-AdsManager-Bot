@@ -1,23 +1,23 @@
-import os
 import asyncio
-
-from aiogram import Bot, Dispatcher
-from aiogram.types import BotCommand
-from aiogram.enums import ParseMode
-from aiogram.client.default import DefaultBotProperties
-from aiogram.exceptions import TelegramNetworkError
-
-from dotenv import load_dotenv
-
+import logging
+import os
 from contextlib import suppress
 
+from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramNetworkError
+from aiogram.types import BotCommand
+from dotenv import load_dotenv
+
 from app.bot.handlers import routers
+from app.core.logging import configure_logging
 from app.db.database import init_db
 from app.db.services import get_user_session_service
 from app.userbot.client import (
-    start_active_client,
-    cleanup_pending_clients_loop,
     InvalidStoredSessionError,
+    cleanup_pending_clients_loop,
+    start_active_client,
 )
 
 
@@ -25,28 +25,32 @@ RESTORE_CONCURRENCY = 10
 RESTORE_MAX_ATTEMPTS = 3
 RESTORE_INITIAL_DELAY = 2
 
+logger = logging.getLogger(__name__)
 
-load_dotenv() # загружаем переменные окружения из .env файла
+load_dotenv()
 
 
 async def set_commands(bot: Bot):
     commands = [
-        BotCommand(command='/start', description='Перезапуск бота'),
-        BotCommand(command='/help', description='Список команд'),
-        BotCommand(command='/cancel', description='Отмена команды'),
-        BotCommand(command='/auth', description='Авторизация юзербота'),
-        BotCommand(command='/numauth', description='Авторизация по номеру'),
-        BotCommand(command='/qrauth', description='Авторизация по QR-коду'),
-        BotCommand(command='/settings', description='Настройки юзербота'),
-        BotCommand(command='/deauth', description='Деавторизация юзербота'),
-        BotCommand(command='/mychannels', description='Управление каналами'),
-        BotCommand(command='/addchannel', description='Добавить канал'),
-        BotCommand(command='/delchannel', description='Удалить канал'),
-        BotCommand(command='/channels', description='Каналы рекламодателей'),
-        BotCommand(command='/banned', description='Заблокированные каналы'),
-        BotCommand(command='/muted', description='Замьюченные каналы'),
-        BotCommand(command='/ban', description='Заблокировать канал'),
-        BotCommand(command='/mute', description='Замьютить канал'),
+        BotCommand(command="/start", description="Запуск бота"),
+        BotCommand(command="/help", description="Список команд"),
+        BotCommand(command="/cancel", description="Отмена команды"),
+        BotCommand(command="/auth", description="Авторизация юзербота"),
+        BotCommand(command="/numauth", description="Авторизация по номеру"),
+        BotCommand(command="/qrauth", description="Авторизация по QR-коду"),
+        BotCommand(command="/settings", description="Настройки юзербота"),
+        BotCommand(command="/monitors", description="Список отслеживаемых каналов"),
+        BotCommand(command="/addmonitor", description="Добавить каналы для мониторинга"),
+        BotCommand(command="/delmonitor", description="Удалить мониторы"),
+        BotCommand(command="/deauth", description="Деавторизация юзербота"),
+        BotCommand(command="/mychannels", description="Управление каналами"),
+        BotCommand(command="/addchannel", description="Добавить канал"),
+        BotCommand(command="/delchannel", description="Удалить канал"),
+        BotCommand(command="/channels", description="Каналы рекламодателей"),
+        BotCommand(command="/banned", description="Заблокированные каналы"),
+        BotCommand(command="/muted", description="Замьюченные каналы"),
+        BotCommand(command="/ban", description="Заблокировать канал"),
+        BotCommand(command="/mute", description="Замьютить канал"),
     ]
     await bot.set_my_commands(commands)
 
@@ -63,14 +67,16 @@ async def set_commands_with_retry(
         try:
             await set_commands(bot)
             return
-        except TelegramNetworkError as e:
+        except TelegramNetworkError as exc:
             if attempt == max_attempts:
                 raise
 
-            print(
-                f"[startup] Нет соединения с api.telegram.org "
-                f"(попытка {attempt}/{max_attempts}): {e}. "
-                f"Повтор через {delay} сек..."
+            logger.warning(
+                "No connection to api.telegram.org (attempt %s/%s): %s. Retry in %ss",
+                attempt,
+                max_attempts,
+                exc,
+                delay,
             )
             await asyncio.sleep(delay)
             delay = min(delay * 2, max_delay)
@@ -91,16 +97,19 @@ async def restore_active_clients_on_startup(
             result = await restore_one_session(tg_id, session_str)
             stats[result] = stats.get(result, 0) + 1
 
-    tasks = [asyncio.create_task(worker(tg_id, session_str)) for tg_id, session_str in sessions]
+    tasks = [
+        asyncio.create_task(worker(tg_id, session_str))
+        for tg_id, session_str in sessions
+    ]
     if tasks:
         await asyncio.gather(*tasks)
 
-    print(
-        "[startup] restore summary: "
-        f"restored={stats['restored']}, "
-        f"cleared={stats['cleared']}, "
-        f"network_failed={stats['network_failed']}, "
-        f"failed={stats['failed']}"
+    logger.info(
+        "Restore summary: restored=%s, cleared=%s, network_failed=%s, failed=%s",
+        stats["restored"],
+        stats["cleared"],
+        stats["network_failed"],
+        stats["failed"],
     )
 
 
@@ -117,42 +126,57 @@ async def restore_one_session(
             await start_active_client(tg_id, session_str)
             return "restored"
 
-        except InvalidStoredSessionError as e:
+        except InvalidStoredSessionError as exc:
             await get_user_session_service().clear_user_session(tg_id)
-            print(f"[startup] Cleared invalid session for user {tg_id}: {e}")
+            logger.warning("Cleared invalid session for user %s: %s", tg_id, exc)
             return "cleared"
 
-        except (OSError, asyncio.TimeoutError) as e:
+        except (OSError, asyncio.TimeoutError) as exc:
             if attempt == max_attempts:
-                print(f"[startup] Network fail for {tg_id} after {attempt} attempts: {e}")
+                logger.warning(
+                    "Network failure for user %s after %s attempts: %s",
+                    tg_id,
+                    attempt,
+                    exc,
+                )
                 return "network_failed"
 
-            print(
-                f"[startup] Network issue restoring {tg_id} "
-                f"({attempt}/{max_attempts}), retry in {delay}s: {e}"
+            logger.warning(
+                "Network issue while restoring user %s (%s/%s), retry in %ss: %s",
+                tg_id,
+                attempt,
+                max_attempts,
+                delay,
+                exc,
             )
             await asyncio.sleep(delay)
             delay = min(delay * 2, 20)
 
-        except Exception as e:
-            print(f"[startup] Unexpected restore error for {tg_id}: {e}")
+        except Exception as exc:
+            logger.exception("Unexpected restore error for user %s: %s", tg_id, exc)
             return "failed"
 
     return "failed"
 
 
 async def main():
+    logger.info("Starting application")
     await init_db()
+    logger.info("Database initialized")
 
     await restore_active_clients_on_startup()
+    logger.info("Active clients restore finished")
 
     bot = None
     cleanup_task = asyncio.create_task(cleanup_pending_clients_loop())
 
     try:
         bot = Bot(
-            token=os.getenv('BOT_TOKEN'),
-            default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+            token=os.getenv("BOT_TOKEN"),
+            default=DefaultBotProperties(
+                parse_mode=ParseMode.HTML,
+                link_preview_is_disabled=True,
+            ),
         )
 
         dp = Dispatcher()
@@ -160,9 +184,11 @@ async def main():
             dp.include_router(router)
 
         await set_commands_with_retry(bot)
+        logger.info("Bot commands configured, starting polling")
         await dp.start_polling(bot)
 
     finally:
+        logger.info("Shutting down application")
         cleanup_task.cancel()
         with suppress(asyncio.CancelledError):
             await cleanup_task
@@ -172,8 +198,9 @@ async def main():
                 await bot.session.close()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
+    configure_logging()
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print('\nBye!')
+        logger.info("Stopped by keyboard interrupt")
