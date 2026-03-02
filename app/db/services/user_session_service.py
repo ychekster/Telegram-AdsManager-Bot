@@ -20,6 +20,15 @@ class UserSessionService:
     async def clear_user_session(self, tg_id: int) -> None:
         await self._user_repository.clear_user_session(tg_id)
 
+    async def set_user_feed(self, tg_id: int, feed_chat_id: int, feed_chat_title: str) -> None:
+        await self._user_repository.set_user_feed(tg_id, feed_chat_id, feed_chat_title)
+
+    async def get_user_feed(self, tg_id: int) -> tuple[int, str] | None:
+        return await self._user_repository.get_user_feed(tg_id)
+
+    async def clear_user_feed(self, tg_id: int) -> None:
+        await self._user_repository.clear_user_feed(tg_id)
+
 
 _user_session_service = UserSessionService(UserRepository())
 

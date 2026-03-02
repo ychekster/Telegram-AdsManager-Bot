@@ -95,6 +95,51 @@ async def _ensure_monitored_channels_compat() -> None:
         await connection.commit()
 
 
+async def _ensure_users_feed_compat() -> None:
+    async with engine.begin() as connection:
+        dialect = connection.dialect.name
+
+        if dialect == "sqlite":
+            table_exists = await connection.execute(
+                text("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
+            )
+            if table_exists.first() is None:
+                return
+
+            cols_result = await connection.execute(text("PRAGMA table_info(users)"))
+            cols = {row[1] for row in cols_result.fetchall()}
+
+            if "feed_chat_id" not in cols:
+                await connection.execute(text("ALTER TABLE users ADD COLUMN feed_chat_id BIGINT"))
+            if "feed_chat_title" not in cols:
+                await connection.execute(text("ALTER TABLE users ADD COLUMN feed_chat_title TEXT"))
+            await connection.commit()
+            return
+
+        table_exists = await connection.execute(
+            text(
+                "SELECT 1 FROM information_schema.tables "
+                "WHERE table_name='users'"
+            )
+        )
+        if table_exists.first() is None:
+            return
+
+        cols_result = await connection.execute(
+            text(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name='users'"
+            )
+        )
+        cols = {row[0] for row in cols_result.fetchall()}
+
+        if "feed_chat_id" not in cols:
+            await connection.execute(text("ALTER TABLE users ADD COLUMN feed_chat_id BIGINT"))
+        if "feed_chat_title" not in cols:
+            await connection.execute(text("ALTER TABLE users ADD COLUMN feed_chat_title TEXT"))
+        await connection.commit()
+
+
 async def init_db() -> None:
     try:
         logger.info("Applying database migrations to head")
@@ -110,6 +155,12 @@ async def init_db() -> None:
         logger.info("Database compatibility checks applied")
     except Exception:
         logger.exception("Failed database compatibility checks")
+
+    try:
+        await _ensure_users_feed_compat()
+        logger.info("Users feed compatibility checks applied")
+    except Exception:
+        logger.exception("Failed users feed compatibility checks")
 
 
 async def add_user_if_not_exists(tg_id: int) -> None:
@@ -130,3 +181,15 @@ async def get_all_sessions() -> list[tuple[int, str]]:
 
 async def clear_user_session(tg_id: int) -> None:
     await get_user_session_service().clear_user_session(tg_id)
+
+
+async def set_user_feed(tg_id: int, feed_chat_id: int, feed_chat_title: str) -> None:
+    await get_user_session_service().set_user_feed(tg_id, feed_chat_id, feed_chat_title)
+
+
+async def get_user_feed(tg_id: int) -> tuple[int, str] | None:
+    return await get_user_session_service().get_user_feed(tg_id)
+
+
+async def clear_user_feed(tg_id: int) -> None:
+    await get_user_session_service().clear_user_feed(tg_id)

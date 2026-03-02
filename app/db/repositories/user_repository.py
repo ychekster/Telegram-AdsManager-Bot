@@ -83,3 +83,35 @@ class UserRepository:
             stmt = update(User).where(User.tg_id == tg_id).values(session_str=None)
             await session.execute(stmt)
             await session.commit()
+
+    async def set_user_feed(self, tg_id: int, feed_chat_id: int, feed_chat_title: str) -> None:
+        await self.add_user_if_not_exists(tg_id)
+        async with SessionFactory() as session:
+            stmt = (
+                update(User)
+                .where(User.tg_id == tg_id)
+                .values(feed_chat_id=feed_chat_id, feed_chat_title=feed_chat_title)
+            )
+            await session.execute(stmt)
+            await session.commit()
+
+    async def get_user_feed(self, tg_id: int) -> tuple[int, str] | None:
+        async with SessionFactory() as session:
+            stmt = select(User.feed_chat_id, User.feed_chat_title).where(User.tg_id == tg_id).limit(1)
+            row = (await session.execute(stmt)).first()
+            if not row:
+                return None
+            feed_chat_id, feed_chat_title = row
+            if feed_chat_id is None:
+                return None
+            return int(feed_chat_id), str(feed_chat_title or "")
+
+    async def clear_user_feed(self, tg_id: int) -> None:
+        async with SessionFactory() as session:
+            stmt = (
+                update(User)
+                .where(User.tg_id == tg_id)
+                .values(feed_chat_id=None, feed_chat_title=None)
+            )
+            await session.execute(stmt)
+            await session.commit()

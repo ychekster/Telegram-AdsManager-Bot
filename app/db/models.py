@@ -16,6 +16,8 @@ class User(Base):
         default=lambda: datetime.now(timezone.utc),
     )
     session_str: Mapped[str | None] = mapped_column(Text, nullable=True)
+    feed_chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    feed_chat_title: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class MonitoredChannel(Base):

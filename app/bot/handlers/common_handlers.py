@@ -1,13 +1,17 @@
 import re
 
 from aiogram import F, Router
+from aiogram.enums import ChatType
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
+    ChatMemberAdministrator,
+    ChatMemberOwner,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    MessageOriginChannel,
     ReplyKeyboardRemove,
 )
 from telethon.errors import RPCError
@@ -17,9 +21,16 @@ from telethon.tl.types import Channel
 from app.bot import keyboards as kb
 from app.bot.handlers.auth_helpers import delete_2fa_prompt_msg, is_userbot_already_authorized
 from app.bot.handlers.common_helpers import safe_html
-from app.bot.states import DelMonitor, Monitor
+from app.bot.states import DelMonitor, Feed, Monitor
 from app.bot.texts.common_texts import (
     CANCEL_TEXT,
+    DELFEED_CANCELLED,
+    DELFEED_CONFIRM,
+    DELFEED_FAILED,
+    DELFEED_MESSAGE_UNAVAILABLE,
+    DELFEED_NOT_SET,
+    DELFEED_SUCCESS,
+    DELFEED_UNAVAILABLE,
     DELMONITOR_DONE,
     DELMONITOR_FLOW_EXPIRED,
     DELMONITOR_NOT_SELECTED,
@@ -41,6 +52,16 @@ from app.bot.texts.common_texts import (
     MONITORS_LOAD_FAILED,
     MONITORS_PICK,
     PAGINATION_END_HINT,
+    SETFEED_BOT_NOT_MEMBER,
+    SETFEED_BOT_NO_POST_RIGHTS,
+    SETFEED_ALREADY_SET,
+    SETFEED_CHECK_FAILED,
+    SETFEED_FORWARD_REQUIRED,
+    SETFEED_NOT_CHANNEL,
+    SETFEED_PROMPT,
+    SETFEED_SUCCESS,
+    SETFEED_UNAVAILABLE,
+    SETTINGS_FEED_DETAILS_TEMPLATE,
     SETTINGS_LOAD_FAILED,
     SETTINGS_TEXT,
     SETTINGS_UNAVAILABLE,
@@ -169,6 +190,17 @@ def _build_monitor_deleted_back_kb(page: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="\u2039 Вернуться к мониторам", callback_data=f"monitor_deleted_back:{page}")]
+        ]
+    )
+
+
+def _build_delfeed_confirm_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Отменить", callback_data="delfeed_cancel"),
+                InlineKeyboardButton(text="Подтвердить", callback_data="delfeed_confirm"),
+            ]
         ]
     )
 
@@ -309,6 +341,28 @@ async def _resolve_channel_meta(client, source_link: str) -> tuple[int, int, str
     return None
 
 
+def _extract_forwarded_channel(message: Message) -> tuple[int, str] | None:
+    origin = message.forward_origin
+    if isinstance(origin, MessageOriginChannel):
+        chat = origin.chat
+        if chat.type == ChatType.CHANNEL:
+            return int(chat.id), str(chat.title or "Без названия")
+
+    forward_from_chat = getattr(message, "forward_from_chat", None)
+    if forward_from_chat and getattr(forward_from_chat, "type", None) == ChatType.CHANNEL:
+        return int(forward_from_chat.id), str(getattr(forward_from_chat, "title", "") or "Без названия")
+
+    return None
+
+
+def _bot_can_post_to_channel(member) -> bool:
+    if isinstance(member, ChatMemberOwner):
+        return True
+    if isinstance(member, ChatMemberAdministrator):
+        return bool(member.can_post_messages)
+    return False
+
+
 @common_router.message(Command("cancel"))
 async def cancel(message: Message, state: FSMContext):
     await delete_client(message.from_user.id)
@@ -333,6 +387,110 @@ async def cmd_start(message: Message):
 @common_router.message(Command("help"))
 async def cmd_help(message: Message):
     await message.answer(HELP_TEXT)
+
+
+@common_router.message(Command("setfeed"))
+async def cmd_setfeed(message: Message, state: FSMContext):
+    if not await is_userbot_already_authorized(message.from_user.id):
+        await message.answer(SETFEED_UNAVAILABLE)
+        return
+
+    existing_feed = await user_session_service.get_user_feed(message.from_user.id)
+    if existing_feed is not None:
+        await message.answer(SETFEED_ALREADY_SET)
+        return
+
+    await state.set_state(Feed.waiting_channel_forward)
+    await message.answer(SETFEED_PROMPT)
+
+
+@common_router.message(Command("delfeed"))
+async def cmd_delfeed(message: Message):
+    if not await is_userbot_already_authorized(message.from_user.id):
+        await message.answer(DELFEED_UNAVAILABLE)
+        return
+
+    feed = await user_session_service.get_user_feed(message.from_user.id)
+    if feed is None:
+        await message.answer(DELFEED_NOT_SET)
+        return
+
+    await message.answer(DELFEED_CONFIRM, reply_markup=_build_delfeed_confirm_kb())
+
+
+@common_router.message(Feed.waiting_channel_forward)
+async def setfeed_wait_channel_forward(message: Message, state: FSMContext):
+    existing_feed = await user_session_service.get_user_feed(message.from_user.id)
+    if existing_feed is not None:
+        await state.clear()
+        await message.answer(SETFEED_ALREADY_SET)
+        return
+
+    forwarded_channel = _extract_forwarded_channel(message)
+    if not forwarded_channel:
+        await message.answer(SETFEED_FORWARD_REQUIRED)
+        return
+
+    feed_chat_id, fallback_title = forwarded_channel
+
+    try:
+        chat = await message.bot.get_chat(feed_chat_id)
+    except Exception:
+        await message.answer(SETFEED_CHECK_FAILED)
+        return
+
+    if chat.type != ChatType.CHANNEL:
+        await message.answer(SETFEED_NOT_CHANNEL)
+        return
+
+    try:
+        bot_user = await message.bot.get_me()
+        bot_member = await message.bot.get_chat_member(feed_chat_id, bot_user.id)
+    except Exception:
+        await message.answer(SETFEED_BOT_NOT_MEMBER)
+        return
+
+    if not _bot_can_post_to_channel(bot_member):
+        await message.answer(SETFEED_BOT_NO_POST_RIGHTS)
+        return
+
+    await user_session_service.set_user_feed(
+        message.from_user.id,
+        feed_chat_id=feed_chat_id,
+        feed_chat_title=str(getattr(chat, "title", None) or fallback_title),
+    )
+    await state.clear()
+    await message.answer(SETFEED_SUCCESS)
+
+
+@common_router.callback_query(F.data == "delfeed_cancel")
+async def delfeed_cancel(callback: CallbackQuery):
+    await callback.answer()
+    if not callback.message:
+        await callback.answer(DELFEED_MESSAGE_UNAVAILABLE, show_alert=False)
+        return
+    await callback.message.edit_text(DELFEED_CANCELLED)
+
+
+@common_router.callback_query(F.data == "delfeed_confirm")
+async def delfeed_confirm(callback: CallbackQuery):
+    await callback.answer()
+    if not callback.message:
+        await callback.answer(DELFEED_MESSAGE_UNAVAILABLE, show_alert=False)
+        return
+
+    feed = await user_session_service.get_user_feed(callback.from_user.id)
+    if feed is None:
+        await callback.message.edit_text(DELFEED_NOT_SET)
+        return
+
+    try:
+        await user_session_service.clear_user_feed(callback.from_user.id)
+    except Exception:
+        await callback.message.edit_text(DELFEED_FAILED)
+        return
+
+    await callback.message.edit_text(DELFEED_SUCCESS)
 
 
 @common_router.message(Command("monitors"))
@@ -668,4 +826,11 @@ async def cmd_settings(message: Message):
         phone=safe_html(me.phone),
         premium=safe_html(premium),
     )
+    feed = await user_session_service.get_user_feed(user_id)
+    if feed is not None:
+        feed_chat_id, feed_title = feed
+        text += SETTINGS_FEED_DETAILS_TEMPLATE.format(
+            feed_title=safe_html(feed_title or "Без названия"),
+            feed_chat_id=safe_html(feed_chat_id),
+        )
     await message.answer(text)

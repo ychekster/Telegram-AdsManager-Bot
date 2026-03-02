@@ -16,3 +16,7 @@ class Monitor(StatesGroup):
 
 class DelMonitor(StatesGroup):
     selecting = State()
+
+
+class Feed(StatesGroup):
+    waiting_channel_forward = State()

@@ -39,6 +39,8 @@ async def set_commands(bot: Bot):
         BotCommand(command="/numauth", description="Авторизация по номеру"),
         BotCommand(command="/qrauth", description="Авторизация по QR-коду"),
         BotCommand(command="/settings", description="Настройки юзербота"),
+        BotCommand(command="/setfeed", description="Установить канал-сборник рекламы"),
+        BotCommand(command="/delfeed", description="Удалить канал-сборник рекламы"),
         BotCommand(command="/monitors", description="Список отслеживаемых каналов"),
         BotCommand(command="/addmonitor", description="Добавить каналы для мониторинга"),
         BotCommand(command="/delmonitor", description="Удалить мониторы"),
