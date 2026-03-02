@@ -16,7 +16,9 @@ from app.db.database import init_db
 from app.db.services import get_user_session_service
 from app.userbot.client import (
     InvalidStoredSessionError,
+    bind_delivery_bot,
     cleanup_pending_clients_loop,
+    close_delivery_bot,
     start_active_client,
 )
 
@@ -180,6 +182,7 @@ async def main():
                 link_preview_is_disabled=True,
             ),
         )
+        bind_delivery_bot(bot)
 
         dp = Dispatcher()
         for router in routers:
@@ -198,6 +201,8 @@ async def main():
         if bot is not None:
             with suppress(Exception):
                 await bot.session.close()
+        with suppress(Exception):
+            await close_delivery_bot()
 
 
 if __name__ == "__main__":
