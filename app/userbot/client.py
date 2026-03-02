@@ -4,14 +4,24 @@ import logging
 import os
 import re
 import time
+from dataclasses import dataclass, field
 
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+    TelegramServerError,
+)
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity
 from aiogram.types.input_file import BufferedInputFile
 from telethon import TelegramClient
 from telethon import events
 from telethon.sessions import StringSession
+from telethon.tl.functions.messages import CheckChatInviteRequest
+from telethon.tl.types import Channel
 from telethon.tl.types import MessageEntityMention, MessageEntityTextUrl, MessageEntityUrl, PeerChannel
 
 from dotenv import load_dotenv
@@ -28,6 +38,11 @@ api_hash = os.getenv("API_HASH")
 PENDING_TTL_SECONDS = 15 * 60
 PENDING_CLEANUP_INTERVAL = 30
 MAX_PARALLEL_AUTH_REQUESTS = 200
+RUNTIME_SYNC_INTERVAL_SECONDS = 20
+LINK_RESOLVE_CACHE_TTL_SECONDS = 30 * 60
+DELIVERY_QUEUE_MAXSIZE = 2000
+DELIVERY_WORKERS = 4
+DELIVERY_RETRY_ATTEMPTS = 5
 
 logger = logging.getLogger(__name__)
 
@@ -62,9 +77,12 @@ _pending_clients: dict[int, tuple[TelegramClient, float]] = {}
 _auth_semaphore = asyncio.Semaphore(MAX_PARALLEL_AUTH_REQUESTS)
 
 _active_clients: dict[int, TelegramClient] = {}
-_monitor_handlers: dict[int, object] = {}
+_user_runtimes: dict[int, "UserRuntime"] = {}
 _delivery_bot: Bot | None = None
 _delivery_bot_owned = False
+_delivery_queue: asyncio.Queue["DeliveryJob"] = asyncio.Queue(maxsize=DELIVERY_QUEUE_MAXSIZE)
+_delivery_workers: list[asyncio.Task] = []
+_resolved_tg_links_cache: dict[str, tuple[int | None, float]] = {}
 
 _URL_RE = re.compile(
     r"(?i)\b((?:https?://|tg://)[^\s<>\"]+|(?:t\.me|telegram\.me)/[^\s<>\"]+)"
@@ -85,6 +103,25 @@ _POST_BUTTON_TEXT = "Открыть пост"
 _TARGET_BUTTON_TEXT = "Рекламная ссылка"
 
 
+@dataclass
+class UserRuntime:
+    tg_user_id: int
+    client: TelegramClient
+    monitor_ids: set[int] = field(default_factory=set)
+    feed_chat_id: int | None = None
+    handler: object | None = None
+    sync_task: asyncio.Task | None = None
+
+
+@dataclass
+class DeliveryJob:
+    feed_chat_id: int
+    text: str
+    entities: list[MessageEntity]
+    keyboard: InlineKeyboardMarkup
+    photo_bytes: bytes | None = None
+
+
 def get_auth_semaphore() -> asyncio.Semaphore:
     return _auth_semaphore
 
@@ -93,11 +130,13 @@ def bind_delivery_bot(bot: Bot) -> None:
     global _delivery_bot, _delivery_bot_owned
     _delivery_bot = bot
     _delivery_bot_owned = False
+    _ensure_delivery_workers()
 
 
 async def _get_delivery_bot() -> Bot | None:
     global _delivery_bot, _delivery_bot_owned
     if _delivery_bot is not None:
+        _ensure_delivery_workers()
         return _delivery_bot
 
     token = os.getenv("BOT_TOKEN")
@@ -110,11 +149,23 @@ async def _get_delivery_bot() -> Bot | None:
         default=DefaultBotProperties(link_preview_is_disabled=True),
     )
     _delivery_bot_owned = True
+    _ensure_delivery_workers()
     return _delivery_bot
 
 
 async def close_delivery_bot() -> None:
     global _delivery_bot, _delivery_bot_owned
+    for worker in _delivery_workers:
+        worker.cancel()
+    for worker in _delivery_workers:
+        try:
+            await worker
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Delivery worker shutdown failed")
+    _delivery_workers.clear()
+
     if _delivery_bot is None:
         return
     if _delivery_bot_owned:
@@ -124,6 +175,95 @@ async def close_delivery_bot() -> None:
             logger.exception("Failed to close owned delivery bot session")
     _delivery_bot = None
     _delivery_bot_owned = False
+
+
+def _ensure_delivery_workers() -> None:
+    if _delivery_workers:
+        return
+    for idx in range(DELIVERY_WORKERS):
+        task = asyncio.create_task(_delivery_worker_loop(idx))
+        _delivery_workers.append(task)
+
+
+async def _send_job_with_retries(bot: Bot, job: DeliveryJob) -> None:
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            if job.photo_bytes is not None:
+                filename = f"ad_{int(time.time())}.jpg"
+                caption = job.text[:1024] if job.text else None
+                caption_entities = [
+                    e
+                    for e in job.entities
+                    if int(getattr(e, "offset", 0)) + int(getattr(e, "length", 0)) <= len(caption or "")
+                ]
+                await bot.send_photo(
+                    chat_id=job.feed_chat_id,
+                    photo=BufferedInputFile(job.photo_bytes, filename=filename),
+                    caption=caption,
+                    caption_entities=caption_entities or None,
+                    parse_mode=None,
+                    reply_markup=job.keyboard,
+                )
+            else:
+                await bot.send_message(
+                    chat_id=job.feed_chat_id,
+                    text=job.text,
+                    entities=job.entities or None,
+                    parse_mode=None,
+                    reply_markup=job.keyboard,
+                )
+            return
+        except TelegramRetryAfter as exc:
+            if attempt >= DELIVERY_RETRY_ATTEMPTS:
+                raise
+            await asyncio.sleep(float(getattr(exc, "retry_after", 1)) + 0.25)
+        except (TelegramNetworkError, TelegramServerError):
+            if attempt >= DELIVERY_RETRY_ATTEMPTS:
+                raise
+            await asyncio.sleep(min(2 ** (attempt - 1), 8))
+        except TelegramBadRequest:
+            # Fallback for invalid entities/caption_entities.
+            if job.photo_bytes is not None:
+                filename = f"ad_{int(time.time())}.jpg"
+                await bot.send_photo(
+                    chat_id=job.feed_chat_id,
+                    photo=BufferedInputFile(job.photo_bytes, filename=filename),
+                    caption=(job.text[:1024] if job.text else None),
+                    parse_mode=None,
+                    reply_markup=job.keyboard,
+                )
+            else:
+                await bot.send_message(
+                    chat_id=job.feed_chat_id,
+                    text=job.text,
+                    parse_mode=None,
+                    reply_markup=job.keyboard,
+                )
+            return
+        except TelegramForbiddenError:
+            # Permanent for this feed chat until user fixes permissions/settings.
+            raise
+
+
+async def _delivery_worker_loop(worker_idx: int) -> None:
+    while True:
+        job = await _delivery_queue.get()
+        try:
+            bot = await _get_delivery_bot()
+            if bot is None:
+                logger.warning("Delivery bot unavailable, dropping queued job")
+                continue
+            await _send_job_with_retries(bot, job)
+        except Exception:
+            logger.exception(
+                "Delivery worker %s failed sending job to feed %s",
+                worker_idx,
+                job.feed_chat_id,
+            )
+        finally:
+            _delivery_queue.task_done()
 
 
 def _extract_links(message_text: str, entities: list[object] | None) -> list[str]:
@@ -248,7 +388,198 @@ def _build_forward_keyboard(post_link: str, external_link: str) -> InlineKeyboar
     )
 
 
-async def _handle_monitor_message(tg_user_id: int, client: TelegramClient, event) -> None:
+def _convert_entities_to_bot_api(entities: list[object] | None) -> list[MessageEntity]:
+    if not entities:
+        return []
+
+    type_map = {
+        "MessageEntityBold": "bold",
+        "MessageEntityItalic": "italic",
+        "MessageEntityUnderline": "underline",
+        "MessageEntityStrike": "strikethrough",
+        "MessageEntitySpoiler": "spoiler",
+        "MessageEntityCode": "code",
+        "MessageEntityPre": "pre",
+        "MessageEntityTextUrl": "text_link",
+        "MessageEntityUrl": "url",
+        "MessageEntityMention": "mention",
+        "MessageEntityHashtag": "hashtag",
+        "MessageEntityCashtag": "cashtag",
+        "MessageEntityBotCommand": "bot_command",
+        "MessageEntityEmail": "email",
+        "MessageEntityPhone": "phone_number",
+        "MessageEntityBlockquote": "blockquote",
+        "MessageEntityCustomEmoji": "custom_emoji",
+    }
+
+    result: list[MessageEntity] = []
+    for entity in entities:
+        cls_name = entity.__class__.__name__
+        ent_type = type_map.get(cls_name)
+        if not ent_type:
+            if cls_name == "MessageEntityMentionName":
+                ent_type = "text_link"
+            else:
+                continue
+
+        kwargs: dict[str, object] = {
+            "type": ent_type,
+            "offset": int(getattr(entity, "offset", 0)),
+            "length": int(getattr(entity, "length", 0)),
+        }
+        if ent_type == "text_link":
+            if cls_name == "MessageEntityMentionName":
+                user_id = getattr(entity, "user_id", None)
+                if user_id is None:
+                    continue
+                kwargs["url"] = f"tg://user?id={int(user_id)}"
+            else:
+                url = getattr(entity, "url", None)
+                if not url:
+                    continue
+                kwargs["url"] = str(url)
+        if ent_type == "pre":
+            language = getattr(entity, "language", None)
+            if language:
+                kwargs["language"] = str(language)
+        if ent_type == "custom_emoji":
+            doc_id = getattr(entity, "document_id", None)
+            if doc_id is None:
+                continue
+            kwargs["custom_emoji_id"] = str(int(doc_id))
+
+        result.append(MessageEntity(**kwargs))
+
+    return result
+
+
+def _is_telegram_link_like(link: str) -> bool:
+    raw = (link or "").strip()
+    if raw.startswith("@"):
+        return True
+    if _TG_USERNAME_LINK_RE.fullmatch(raw):
+        return True
+    if _TG_INVITE_LINK_RE.fullmatch(raw):
+        return True
+    if _TG_C_LINK_RE.fullmatch(raw):
+        return True
+    return False
+
+
+def _cleanup_resolved_link_cache() -> None:
+    if len(_resolved_tg_links_cache) < 5000:
+        return
+    now = time.monotonic()
+    stale = [key for key, (_, exp) in _resolved_tg_links_cache.items() if exp <= now]
+    for key in stale:
+        _resolved_tg_links_cache.pop(key, None)
+
+
+async def _resolve_telegram_link_channel_id(client: TelegramClient, link: str) -> int | None:
+    raw = (link or "").strip()
+    if not raw:
+        return None
+    cache_key = raw.lower()
+    now = time.monotonic()
+    cached = _resolved_tg_links_cache.get(cache_key)
+    if cached and cached[1] > now:
+        return cached[0]
+
+    result: int | None = None
+    try:
+        if raw.startswith("@") or _TG_USERNAME_LINK_RE.fullmatch(raw):
+            entity = await client.get_entity(raw)
+            if isinstance(entity, Channel):
+                result = int(entity.id)
+        elif _TG_INVITE_LINK_RE.fullmatch(raw):
+            invite_match = _TG_INVITE_LINK_RE.fullmatch(raw)
+            if invite_match:
+                invite = await client(CheckChatInviteRequest(invite_match.group(1)))
+                chat = getattr(invite, "chat", None)
+                if isinstance(chat, Channel):
+                    result = int(chat.id)
+        elif _TG_C_LINK_RE.fullmatch(raw):
+            c_match = _TG_C_LINK_RE.fullmatch(raw)
+            if c_match:
+                result = int(c_match.group(1))
+    except Exception:
+        result = None
+
+    _resolved_tg_links_cache[cache_key] = (result, now + LINK_RESOLVE_CACHE_TTL_SECONDS)
+    _cleanup_resolved_link_cache()
+    return result
+
+
+async def _is_external_link(
+    client: TelegramClient,
+    link: str,
+    source_channel_id: int,
+    source_username: str | None,
+) -> bool:
+    if _is_same_channel_link(link, source_channel_id, source_username):
+        return False
+
+    if not _is_telegram_link_like(link):
+        return True
+
+    resolved = await _resolve_telegram_link_channel_id(client, link)
+    if resolved is None:
+        return True
+    return int(resolved) != int(source_channel_id)
+
+
+async def _refresh_runtime_state(runtime: UserRuntime, force_rebind: bool = False) -> None:
+    monitors = await get_monitored_channel_service().get_user_monitors(runtime.tg_user_id)
+    monitor_ids = {int(row[2]) for row in monitors if int(row[2]) > 0}
+    feed = await get_user_session_service().get_user_feed(runtime.tg_user_id)
+    feed_chat_id = int(feed[0]) if feed is not None else None
+
+    need_rebind = force_rebind or monitor_ids != runtime.monitor_ids
+    runtime.monitor_ids = monitor_ids
+    runtime.feed_chat_id = feed_chat_id
+
+    if not need_rebind:
+        return
+
+    if runtime.handler is not None:
+        try:
+            runtime.client.remove_event_handler(runtime.handler)
+        except Exception:
+            logger.exception("Failed removing old monitor handler for user %s", runtime.tg_user_id)
+        runtime.handler = None
+
+    if not runtime.monitor_ids:
+        logger.info("Monitor handler disabled for user %s (no monitors)", runtime.tg_user_id)
+        return
+
+    chats = [PeerChannel(channel_id=i) for i in sorted(runtime.monitor_ids)]
+
+    @runtime.client.on(events.NewMessage(chats=chats))
+    async def _on_new_message(event):
+        await _handle_monitor_message(runtime, event)
+
+    runtime.handler = _on_new_message
+    logger.info(
+        "Monitor handler updated for user %s (monitors=%s)",
+        runtime.tg_user_id,
+        len(runtime.monitor_ids),
+    )
+
+
+async def _runtime_sync_loop(runtime: UserRuntime) -> None:
+    while True:
+        try:
+            await _refresh_runtime_state(runtime)
+        except Exception:
+            logger.exception("Runtime sync failed for user %s", runtime.tg_user_id)
+        await asyncio.sleep(RUNTIME_SYNC_INTERVAL_SECONDS)
+
+
+async def _enqueue_delivery(job: DeliveryJob) -> None:
+    await _delivery_queue.put(job)
+
+
+async def _handle_monitor_message(runtime: UserRuntime, event) -> None:
     try:
         msg = event.message
         if msg is None:
@@ -257,73 +588,80 @@ async def _handle_monitor_message(tg_user_id: int, client: TelegramClient, event
             return
 
         source_channel_id = int(msg.peer_id.channel_id)
-        monitors = await get_monitored_channel_service().get_user_monitors(tg_user_id)
-        monitored_channel_ids = {int(row[2]) for row in monitors if int(row[2]) > 0}
-        if source_channel_id not in monitored_channel_ids:
+        if source_channel_id not in runtime.monitor_ids:
             return
 
-        feed = await get_user_session_service().get_user_feed(tg_user_id)
-        if feed is None:
+        feed_chat_id = runtime.feed_chat_id
+        if feed_chat_id is None:
             return
-        feed_chat_id, _ = feed
 
-        chat = await event.get_chat()
+        chat = event.chat or await event.get_chat()
         source_username = str(getattr(chat, "username", "") or "").strip() or None
 
-        text = str(getattr(msg, "message", "") or "")
-        links = _extract_links(text, list(getattr(msg, "entities", None) or []))
-        external_link = next(
-            (lnk for lnk in links if not _is_same_channel_link(lnk, source_channel_id, source_username)),
-            None,
-        )
+        plain_text = str(getattr(msg, "message", "") or "")
+        raw_entities = list(getattr(msg, "entities", None) or [])
+        bot_entities = _convert_entities_to_bot_api(raw_entities)
+        links = _extract_links(plain_text, raw_entities)
+        external_link: str | None = None
+        keyboard: InlineKeyboardMarkup | None = None
+        post_link = _build_post_link(source_channel_id, source_username, int(msg.id))
+        for candidate in links:
+            if not await _is_external_link(runtime.client, candidate, source_channel_id, source_username):
+                continue
+            candidate_kb = _build_forward_keyboard(post_link, candidate)
+            if candidate_kb is None:
+                continue
+            external_link = candidate
+            keyboard = candidate_kb
+            break
         if not external_link:
             return
-
-        post_link = _build_post_link(source_channel_id, source_username, int(msg.id))
-        keyboard = _build_forward_keyboard(post_link, external_link)
         if keyboard is None:
-            return
-
-        bot = await _get_delivery_bot()
-        if bot is None:
             return
 
         has_photo = getattr(msg, "photo", None) is not None
         if has_photo:
-            image_bytes = await client.download_media(msg, file=bytes)
+            image_bytes = await runtime.client.download_media(msg, file=bytes)
             if image_bytes:
-                filename = f"ad_{tg_user_id}_{source_channel_id}_{msg.id}.jpg"
-                caption = text[:1024] if text else None
-                await bot.send_photo(
-                    chat_id=feed_chat_id,
-                    photo=BufferedInputFile(image_bytes, filename=filename),
-                    caption=caption,
-                    parse_mode=None,
-                    reply_markup=keyboard,
+                await _enqueue_delivery(
+                    DeliveryJob(
+                        feed_chat_id=feed_chat_id,
+                        text=plain_text or external_link,
+                        entities=bot_entities,
+                        keyboard=keyboard,
+                        photo_bytes=image_bytes,
+                    )
                 )
                 return
 
-        payload_text = text or external_link
-        await bot.send_message(
-            chat_id=feed_chat_id,
-            text=payload_text,
-            parse_mode=None,
-            reply_markup=keyboard,
+        payload_plain = plain_text or external_link
+        await _enqueue_delivery(
+            DeliveryJob(
+                feed_chat_id=feed_chat_id,
+                text=payload_plain,
+                entities=bot_entities,
+                keyboard=keyboard,
+            )
         )
     except Exception:
-        logger.exception("Failed to handle monitor message for user %s", tg_user_id)
+        logger.exception("Failed to handle monitor message for user %s", runtime.tg_user_id)
 
 
 def _attach_monitor_handler(tg_user_id: int, client: TelegramClient) -> None:
-    if tg_user_id in _monitor_handlers:
+    if tg_user_id in _user_runtimes:
         return
 
-    @client.on(events.NewMessage())
-    async def _on_new_message(event):
-        await _handle_monitor_message(tg_user_id, client, event)
+    runtime = UserRuntime(tg_user_id=tg_user_id, client=client)
+    _user_runtimes[tg_user_id] = runtime
 
-    _monitor_handlers[tg_user_id] = _on_new_message
-    logger.info("Attached monitor handler for user %s", tg_user_id)
+    async def _bootstrap() -> None:
+        try:
+            await _refresh_runtime_state(runtime, force_rebind=True)
+        except Exception:
+            logger.exception("Failed bootstrap runtime state for user %s", tg_user_id)
+        runtime.sync_task = asyncio.create_task(_runtime_sync_loop(runtime))
+
+    asyncio.create_task(_bootstrap())
 
 
 async def create_client(user_id: int) -> TelegramClient:
@@ -380,6 +718,8 @@ async def cleanup_pending_clients_loop():
 
 async def start_active_client(tg_user_id: int, session_str: str):
     if tg_user_id in _active_clients:
+        if tg_user_id not in _user_runtimes:
+            _attach_monitor_handler(tg_user_id, _active_clients[tg_user_id])
         logger.debug("Active client already running for user %s", tg_user_id)
         return _active_clients[tg_user_id]
 
@@ -423,14 +763,24 @@ async def start_active_client(tg_user_id: int, session_str: str):
 
 async def stop_active_client(tg_user_id: int):
     client = _active_clients.pop(tg_user_id, None)
+    runtime = _user_runtimes.pop(tg_user_id, None)
 
-    if client:
-        handler = _monitor_handlers.pop(tg_user_id, None)
-        if handler is not None:
+    if runtime is not None:
+        if runtime.sync_task is not None:
+            runtime.sync_task.cancel()
             try:
-                client.remove_event_handler(handler)
+                await runtime.sync_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("Failed stopping runtime sync task for user %s", tg_user_id)
+        if client is not None and runtime.handler is not None:
+            try:
+                client.remove_event_handler(runtime.handler)
             except Exception:
                 logger.exception("Failed to remove monitor handler for user %s", tg_user_id)
+
+    if client:
         await client.disconnect()
         logger.info("Stopped active userbot client for user %s", tg_user_id)
 
@@ -438,9 +788,24 @@ async def stop_active_client(tg_user_id: int):
 async def logout_userbot_session(tg_user_id: int, session_str: str | None) -> bool:
     # 1) Use active in-memory client if available.
     client = _active_clients.pop(tg_user_id, None)
+    runtime = _user_runtimes.pop(tg_user_id, None)
+
+    if runtime is not None and runtime.sync_task is not None:
+        runtime.sync_task.cancel()
+        try:
+            await runtime.sync_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Failed stopping runtime sync task for user %s", tg_user_id)
 
     if client:
         try:
+            if runtime is not None and runtime.handler is not None:
+                try:
+                    client.remove_event_handler(runtime.handler)
+                except Exception:
+                    logger.exception("Failed removing runtime handler for user %s", tg_user_id)
             if not client.is_connected():
                 await client.connect()
             await client.log_out()

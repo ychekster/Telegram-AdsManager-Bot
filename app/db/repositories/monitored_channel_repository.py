@@ -93,16 +93,24 @@ class MonitoredChannelRepository:
                 .order_by(MonitoredChannel.created_at.asc(), MonitoredChannel.id.asc())
             )
             rows = (await session.execute(stmt)).all()
-            return [
-                (
-                    int(m_id),
-                    str(channel_title or "Без названия"),
-                    int(channel_id) if channel_id is not None else 0,
-                    str(channel_link),
-                    created_at,
+            result: list[tuple[int, str, int, str, datetime]] = []
+            seen_channel_ids: set[int] = set()
+            for m_id, channel_title, channel_id, channel_link, created_at in rows:
+                ch_id = int(channel_id) if channel_id is not None else 0
+                if ch_id > 0 and ch_id in seen_channel_ids:
+                    continue
+                if ch_id > 0:
+                    seen_channel_ids.add(ch_id)
+                result.append(
+                    (
+                        int(m_id),
+                        str(channel_title or "Без названия"),
+                        ch_id,
+                        str(channel_link),
+                        created_at,
+                    )
                 )
-                for m_id, channel_title, channel_id, channel_link, created_at in rows
-            ]
+            return result
 
     async def get_user_monitor_by_id(
         self,

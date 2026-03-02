@@ -78,7 +78,7 @@ MONITOR_NO_VALID_LINKS = (
 
 MONITOR_SAVED_TEMPLATE = (
     "Сохранённые каналы:\n\n{links}\n\n"
-    "Отправь /help для получения списка команд."
+    "Отправь /monitors для получения списка отслеживаемых каналов."
 )
 
 MONITORS_EMPTY = (
