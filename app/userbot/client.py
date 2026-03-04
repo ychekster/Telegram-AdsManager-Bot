@@ -5,6 +5,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
@@ -19,6 +20,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, MessageEnt
 from aiogram.types.input_file import BufferedInputFile
 from telethon import TelegramClient
 from telethon import events
+from telethon.errors import FloodWaitError, RPCError
 from telethon.sessions import StringSession
 from telethon.tl.functions.messages import CheckChatInviteRequest
 from telethon.tl.types import Channel
@@ -43,6 +45,8 @@ LINK_RESOLVE_CACHE_TTL_SECONDS = 30 * 60
 DELIVERY_QUEUE_MAXSIZE = 2000
 DELIVERY_WORKERS = 4
 DELIVERY_RETRY_ATTEMPTS = 5
+LINK_RESOLVE_RETRY_ATTEMPTS = 3
+STALE_MESSAGE_MAX_AGE_SECONDS = 180
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +115,7 @@ class UserRuntime:
     feed_chat_id: int | None = None
     handler: object | None = None
     sync_task: asyncio.Task | None = None
+    accepted_from_ts: float = field(default_factory=lambda: time.time() - 5)
 
 
 @dataclass
@@ -486,27 +491,39 @@ async def _resolve_telegram_link_channel_id(client: TelegramClient, link: str) -
         return cached[0]
 
     result: int | None = None
-    try:
-        if raw.startswith("@") or _TG_USERNAME_LINK_RE.fullmatch(raw):
-            entity = await client.get_entity(raw)
-            if isinstance(entity, Channel):
-                result = int(entity.id)
-        elif _TG_INVITE_LINK_RE.fullmatch(raw):
-            invite_match = _TG_INVITE_LINK_RE.fullmatch(raw)
-            if invite_match:
-                invite = await client(CheckChatInviteRequest(invite_match.group(1)))
-                chat = getattr(invite, "chat", None)
-                if isinstance(chat, Channel):
-                    result = int(chat.id)
-        elif _TG_C_LINK_RE.fullmatch(raw):
-            c_match = _TG_C_LINK_RE.fullmatch(raw)
-            if c_match:
-                result = int(c_match.group(1))
-    except Exception:
-        result = None
+    for attempt in range(1, LINK_RESOLVE_RETRY_ATTEMPTS + 1):
+        try:
+            if raw.startswith("@") or _TG_USERNAME_LINK_RE.fullmatch(raw):
+                entity = await client.get_entity(raw)
+                if isinstance(entity, Channel):
+                    result = int(entity.id)
+            elif _TG_INVITE_LINK_RE.fullmatch(raw):
+                invite_match = _TG_INVITE_LINK_RE.fullmatch(raw)
+                if invite_match:
+                    invite = await client(CheckChatInviteRequest(invite_match.group(1)))
+                    chat = getattr(invite, "chat", None)
+                    if isinstance(chat, Channel):
+                        result = int(chat.id)
+            elif _TG_C_LINK_RE.fullmatch(raw):
+                c_match = _TG_C_LINK_RE.fullmatch(raw)
+                if c_match:
+                    result = int(c_match.group(1))
+            break
+        except FloodWaitError as exc:
+            if attempt >= LINK_RESOLVE_RETRY_ATTEMPTS:
+                return None
+            wait_for = max(int(getattr(exc, "seconds", 1)), 1)
+            await asyncio.sleep(min(wait_for, 3))
+        except (RPCError, asyncio.TimeoutError, OSError):
+            if attempt >= LINK_RESOLVE_RETRY_ATTEMPTS:
+                return None
+            await asyncio.sleep(min(0.2 * attempt, 0.8))
+        except Exception:
+            return None
 
-    _resolved_tg_links_cache[cache_key] = (result, now + LINK_RESOLVE_CACHE_TTL_SECONDS)
-    _cleanup_resolved_link_cache()
+    if result is not None:
+        _resolved_tg_links_cache[cache_key] = (result, now + LINK_RESOLVE_CACHE_TTL_SECONDS)
+        _cleanup_resolved_link_cache()
     return result
 
 
@@ -526,6 +543,24 @@ async def _is_external_link(
     if resolved is None:
         return True
     return int(resolved) != int(source_channel_id)
+
+
+async def _is_same_channel_link_strict(
+    client: TelegramClient,
+    link: str,
+    source_channel_id: int,
+    source_username: str | None,
+) -> bool:
+    if _is_same_channel_link(link, source_channel_id, source_username):
+        return True
+
+    if not _is_telegram_link_like(link):
+        return False
+
+    resolved = await _resolve_telegram_link_channel_id(client, link)
+    if resolved is None:
+        return False
+    return int(resolved) == int(source_channel_id)
 
 
 async def _refresh_runtime_state(runtime: UserRuntime, force_rebind: bool = False) -> None:
@@ -569,6 +604,10 @@ async def _refresh_runtime_state(runtime: UserRuntime, force_rebind: bool = Fals
 async def _runtime_sync_loop(runtime: UserRuntime) -> None:
     while True:
         try:
+            if not runtime.client.is_connected():
+                await runtime.client.connect()
+                runtime.accepted_from_ts = time.time() - 2
+                await _refresh_runtime_state(runtime, force_rebind=True)
             await _refresh_runtime_state(runtime)
         except Exception:
             logger.exception("Runtime sync failed for user %s", runtime.tg_user_id)
@@ -587,6 +626,19 @@ async def _handle_monitor_message(runtime: UserRuntime, event) -> None:
         if not isinstance(getattr(msg, "peer_id", None), PeerChannel):
             return
 
+        msg_date = getattr(msg, "date", None)
+        msg_ts = None
+        if isinstance(msg_date, datetime):
+            if msg_date.tzinfo is None:
+                msg_date = msg_date.replace(tzinfo=timezone.utc)
+            msg_ts = msg_date.timestamp()
+        if msg_ts is not None:
+            # Drop stale backlog after sleep/resume and very old updates.
+            if msg_ts < runtime.accepted_from_ts:
+                return
+            if (time.time() - msg_ts) > STALE_MESSAGE_MAX_AGE_SECONDS:
+                return
+
         source_channel_id = int(msg.peer_id.channel_id)
         if source_channel_id not in runtime.monitor_ids:
             return
@@ -602,6 +654,12 @@ async def _handle_monitor_message(runtime: UserRuntime, event) -> None:
         raw_entities = list(getattr(msg, "entities", None) or [])
         bot_entities = _convert_entities_to_bot_api(raw_entities)
         links = _extract_links(plain_text, raw_entities)
+
+        # If post references its own source channel, skip it entirely.
+        for link in links:
+            if await _is_same_channel_link_strict(runtime.client, link, source_channel_id, source_username):
+                return
+
         external_link: str | None = None
         keyboard: InlineKeyboardMarkup | None = None
         post_link = _build_post_link(source_channel_id, source_username, int(msg.id))
