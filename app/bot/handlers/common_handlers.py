@@ -51,6 +51,8 @@ from app.bot.texts.common_texts import (
     MONITORS_EMPTY,
     MONITORS_LOAD_FAILED,
     MONITORS_PICK,
+    MUTED_EMPTY,
+    MUTED_EMPTY_ITEM,
     PAGINATION_END_HINT,
     SETFEED_BOT_NOT_MEMBER,
     SETFEED_BOT_NO_POST_RIGHTS,
@@ -66,13 +68,14 @@ from app.bot.texts.common_texts import (
     SETTINGS_TEXT,
     SETTINGS_UNAVAILABLE,
 )
-from app.db.services import get_monitored_channel_service, get_user_session_service
+from app.db.services import get_monitored_channel_service, get_muted_post_text_service, get_user_session_service
 from app.userbot.client import InvalidStoredSessionError, delete_client, start_active_client
 
 
 common_router = Router(name="common")
 user_session_service = get_user_session_service()
 monitored_channel_service = get_monitored_channel_service()
+muted_post_text_service = get_muted_post_text_service()
 
 CHANNEL_USERNAME_RE = re.compile(r"^@([A-Za-z][A-Za-z0-9_]{3,31})$")
 CHANNEL_LINK_RE = re.compile(
@@ -232,6 +235,55 @@ async def _edit_monitors_page(callback: CallbackQuery, page: int):
         return
 
     await callback.message.edit_text(MONITORS_PICK, reply_markup=_build_monitors_page_kb(monitors, page))
+
+
+def _build_muted_page_kb(page: int, total: int) -> InlineKeyboardMarkup:
+    prev_callback = f"muted_page:{page - 1}" if page > 0 else "muted_nav_noop"
+    next_callback = f"muted_page:{page + 1}" if page < total - 1 else "muted_nav_noop"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="\u2039 Назад", callback_data=prev_callback),
+                InlineKeyboardButton(text="Далее \u203a", callback_data=next_callback),
+            ]
+        ]
+    )
+
+
+def _muted_page_text(muted_text: str) -> str:
+    text = str(muted_text or "").strip()
+    if not text:
+        return MUTED_EMPTY_ITEM
+    return safe_html(text)
+
+
+async def _render_muted_page(message: Message, user_id: int, page: int) -> None:
+    muted_texts = await muted_post_text_service.get_user_muted_texts(user_id)
+    if not muted_texts:
+        await message.answer(MUTED_EMPTY)
+        return
+
+    page = max(0, min(page, len(muted_texts) - 1))
+    await message.answer(
+        _muted_page_text(muted_texts[page]),
+        reply_markup=_build_muted_page_kb(page, len(muted_texts)),
+    )
+
+
+async def _edit_muted_page(callback: CallbackQuery, page: int) -> None:
+    if not callback.message:
+        return
+
+    muted_texts = await muted_post_text_service.get_user_muted_texts(callback.from_user.id)
+    if not muted_texts:
+        await callback.message.edit_text(MUTED_EMPTY)
+        return
+
+    page = max(0, min(page, len(muted_texts) - 1))
+    await callback.message.edit_text(
+        _muted_page_text(muted_texts[page]),
+        reply_markup=_build_muted_page_kb(page, len(muted_texts)),
+    )
 
 
 async def _edit_delmonitors_page(callback: CallbackQuery, state: FSMContext, page: int):
@@ -498,6 +550,11 @@ async def cmd_monitors(message: Message):
     await _render_monitors_page(message, message.from_user.id, page=0)
 
 
+@common_router.message(Command("muted"))
+async def cmd_muted(message: Message):
+    await _render_muted_page(message, message.from_user.id, page=0)
+
+
 @common_router.message(Command("delmonitor"))
 async def cmd_delmonitor(message: Message, state: FSMContext):
     monitors = await monitored_channel_service.get_user_monitors(message.from_user.id)
@@ -694,6 +751,11 @@ async def monitors_nav_noop(callback: CallbackQuery):
     await callback.answer(PAGINATION_END_HINT, show_alert=False)
 
 
+@common_router.callback_query(F.data == "muted_nav_noop")
+async def muted_nav_noop(callback: CallbackQuery):
+    await callback.answer(PAGINATION_END_HINT, show_alert=False)
+
+
 @common_router.callback_query(F.data.startswith("monitors_page:"))
 async def monitors_page(callback: CallbackQuery):
     await callback.answer()
@@ -701,6 +763,15 @@ async def monitors_page(callback: CallbackQuery):
     if not page_part.isdigit():
         return
     await _edit_monitors_page(callback, int(page_part))
+
+
+@common_router.callback_query(F.data.startswith("muted_page:"))
+async def muted_page(callback: CallbackQuery):
+    await callback.answer()
+    page_part = callback.data.split(":", maxsplit=1)[1]
+    if not page_part.isdigit():
+        return
+    await _edit_muted_page(callback, int(page_part))
 
 
 @common_router.callback_query(F.data.startswith("monitor_open:"))

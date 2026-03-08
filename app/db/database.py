@@ -140,6 +140,49 @@ async def _ensure_users_feed_compat() -> None:
         await connection.commit()
 
 
+async def _ensure_muted_post_texts_compat() -> None:
+    async with engine.begin() as connection:
+        dialect = connection.dialect.name
+
+        if dialect == "sqlite":
+            table_exists = await connection.execute(
+                text("SELECT name FROM sqlite_master WHERE type='table' AND name='muted_post_texts'")
+            )
+            if table_exists.first() is None:
+                return
+
+            cols_result = await connection.execute(text("PRAGMA table_info(muted_post_texts)"))
+            cols = {row[1] for row in cols_result.fetchall()}
+            if "muted_text" not in cols:
+                await connection.execute(
+                    text("ALTER TABLE muted_post_texts ADD COLUMN muted_text TEXT NOT NULL DEFAULT ''")
+                )
+            await connection.commit()
+            return
+
+        table_exists = await connection.execute(
+            text(
+                "SELECT 1 FROM information_schema.tables "
+                "WHERE table_name='muted_post_texts'"
+            )
+        )
+        if table_exists.first() is None:
+            return
+
+        cols_result = await connection.execute(
+            text(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name='muted_post_texts'"
+            )
+        )
+        cols = {row[0] for row in cols_result.fetchall()}
+        if "muted_text" not in cols:
+            await connection.execute(
+                text("ALTER TABLE muted_post_texts ADD COLUMN muted_text TEXT NOT NULL DEFAULT ''")
+            )
+        await connection.commit()
+
+
 async def init_db() -> None:
     try:
         logger.info("Applying database migrations to head")
@@ -161,6 +204,12 @@ async def init_db() -> None:
         logger.info("Users feed compatibility checks applied")
     except Exception:
         logger.exception("Failed users feed compatibility checks")
+
+    try:
+        await _ensure_muted_post_texts_compat()
+        logger.info("Muted post texts compatibility checks applied")
+    except Exception:
+        logger.exception("Failed muted post texts compatibility checks")
 
 
 async def add_user_if_not_exists(tg_id: int) -> None:

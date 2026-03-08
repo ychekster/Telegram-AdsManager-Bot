@@ -37,3 +37,21 @@ class MonitoredChannel(Base):
         nullable=False,
         default=lambda: datetime.now(timezone.utc),
     )
+
+
+class MutedPostText(Base):
+    __tablename__ = "muted_post_texts"
+    __table_args__ = (
+        UniqueConstraint("user_tg_id", "text_hash", name="uq_muted_post_text_user_hash"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_tg_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    text_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    muted_text: Mapped[str] = mapped_column(Text, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )

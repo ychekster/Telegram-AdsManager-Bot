@@ -1,9 +1,11 @@
 import asyncio
 import binascii
+import hashlib
 import logging
 import os
 import re
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -28,7 +30,11 @@ from telethon.tl.types import MessageEntityMention, MessageEntityTextUrl, Messag
 
 from dotenv import load_dotenv
 
-from app.db.services import get_monitored_channel_service, get_user_session_service
+from app.db.services import (
+    get_monitored_channel_service,
+    get_muted_post_text_service,
+    get_user_session_service,
+)
 
 
 load_dotenv(".env")
@@ -47,12 +53,22 @@ DELIVERY_WORKERS = 4
 DELIVERY_RETRY_ATTEMPTS = 5
 LINK_RESOLVE_RETRY_ATTEMPTS = 3
 STALE_MESSAGE_MAX_AGE_SECONDS = 180
+POST_TEXT_DEDUP_TTL_DAYS = 7
+DEFERRED_LINK_CHECK_POLL_SECONDS = 5
+DEFERRED_LINK_CHECK_TTL_SECONDS = 6 * 60 * 60
+DEFERRED_LINK_CHECK_MAXSIZE = 3000
 
 logger = logging.getLogger(__name__)
 
 
 class InvalidStoredSessionError(Exception):
     pass
+
+
+class LinkResolutionDeferredError(Exception):
+    def __init__(self, retry_after_seconds: int):
+        self.retry_after_seconds = max(int(retry_after_seconds), 1)
+        super().__init__(f"Link resolution deferred for {self.retry_after_seconds}s")
 
 
 def _is_invalid_session_exception(exc: Exception) -> bool:
@@ -115,7 +131,11 @@ class UserRuntime:
     feed_chat_id: int | None = None
     handler: object | None = None
     sync_task: asyncio.Task | None = None
+    deferred_task: asyncio.Task | None = None
     accepted_from_ts: float = field(default_factory=lambda: time.time() - 5)
+    link_check_blocked_until_ts: float = 0.0
+    deferred_messages: deque["DeferredMonitorMessage"] = field(default_factory=deque)
+    deferred_message_keys: set[tuple[int, int]] = field(default_factory=set)
 
 
 @dataclass
@@ -125,6 +145,14 @@ class DeliveryJob:
     entities: list[MessageEntity]
     keyboard: InlineKeyboardMarkup
     photo_bytes: bytes | None = None
+
+
+@dataclass
+class DeferredMonitorMessage:
+    source_channel_id: int
+    message_id: int
+    queued_at_ts: float
+    message: object
 
 
 def get_auth_semaphore() -> asyncio.Semaphore:
@@ -306,6 +334,17 @@ def _extract_links(message_text: str, entities: list[object] | None) -> list[str
             links.append(value)
 
     return links
+
+
+def _normalize_post_text_for_dedup(text: str) -> str:
+    normalized = str(text or "")
+    normalized = _URL_RE.sub(" ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
+def _post_text_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _is_same_channel_link(link: str, source_channel_id: int, source_username: str | None) -> bool:
@@ -510,10 +549,8 @@ async def _resolve_telegram_link_channel_id(client: TelegramClient, link: str) -
                     result = int(c_match.group(1))
             break
         except FloodWaitError as exc:
-            if attempt >= LINK_RESOLVE_RETRY_ATTEMPTS:
-                return None
             wait_for = max(int(getattr(exc, "seconds", 1)), 1)
-            await asyncio.sleep(min(wait_for, 3))
+            raise LinkResolutionDeferredError(wait_for)
         except (RPCError, asyncio.TimeoutError, OSError):
             if attempt >= LINK_RESOLVE_RETRY_ATTEMPTS:
                 return None
@@ -614,47 +651,120 @@ async def _runtime_sync_loop(runtime: UserRuntime) -> None:
         await asyncio.sleep(RUNTIME_SYNC_INTERVAL_SECONDS)
 
 
+def _queue_deferred_monitor_message(runtime: UserRuntime, msg: object) -> None:
+    peer = getattr(msg, "peer_id", None)
+    if not isinstance(peer, PeerChannel):
+        return
+    source_channel_id = int(peer.channel_id)
+    message_id = int(getattr(msg, "id", 0) or 0)
+    if message_id <= 0:
+        return
+
+    key = (source_channel_id, message_id)
+    if key in runtime.deferred_message_keys:
+        return
+
+    now_ts = time.time()
+    while runtime.deferred_messages and (now_ts - runtime.deferred_messages[0].queued_at_ts) > DEFERRED_LINK_CHECK_TTL_SECONDS:
+        stale_item = runtime.deferred_messages.popleft()
+        runtime.deferred_message_keys.discard((stale_item.source_channel_id, stale_item.message_id))
+
+    if len(runtime.deferred_messages) >= DEFERRED_LINK_CHECK_MAXSIZE:
+        dropped = runtime.deferred_messages.popleft()
+        runtime.deferred_message_keys.discard((dropped.source_channel_id, dropped.message_id))
+
+    runtime.deferred_messages.append(
+        DeferredMonitorMessage(
+            source_channel_id=source_channel_id,
+            message_id=message_id,
+            queued_at_ts=now_ts,
+            message=msg,
+        )
+    )
+    runtime.deferred_message_keys.add(key)
+
+
+async def _process_deferred_monitor_messages(runtime: UserRuntime, max_items: int = 50) -> None:
+    if not runtime.deferred_messages:
+        return
+
+    now_ts = time.time()
+    if now_ts < runtime.link_check_blocked_until_ts:
+        return
+
+    processed = 0
+    while runtime.deferred_messages and processed < max_items:
+        item = runtime.deferred_messages.popleft()
+        runtime.deferred_message_keys.discard((item.source_channel_id, item.message_id))
+
+        if (now_ts - item.queued_at_ts) > DEFERRED_LINK_CHECK_TTL_SECONDS:
+            continue
+
+        await _process_monitor_message(runtime, item.message, bypass_stale_checks=True)
+        processed += 1
+        if time.time() < runtime.link_check_blocked_until_ts:
+            break
+
+
+async def _deferred_monitor_retry_loop(runtime: UserRuntime) -> None:
+    while True:
+        try:
+            await _process_deferred_monitor_messages(runtime)
+        except Exception:
+            logger.exception("Deferred monitor retry loop failed for user %s", runtime.tg_user_id)
+        await asyncio.sleep(DEFERRED_LINK_CHECK_POLL_SECONDS)
+
+
 async def _enqueue_delivery(job: DeliveryJob) -> None:
     await _delivery_queue.put(job)
 
 
-async def _handle_monitor_message(runtime: UserRuntime, event) -> None:
+async def _process_monitor_message(
+    runtime: UserRuntime,
+    msg: object,
+    *,
+    bypass_stale_checks: bool = False,
+) -> None:
+    if msg is None:
+        return
+    peer = getattr(msg, "peer_id", None)
+    if not isinstance(peer, PeerChannel):
+        return
+
+    msg_date = getattr(msg, "date", None)
+    msg_ts = None
+    if isinstance(msg_date, datetime):
+        if msg_date.tzinfo is None:
+            msg_date = msg_date.replace(tzinfo=timezone.utc)
+        msg_ts = msg_date.timestamp()
+    if (not bypass_stale_checks) and msg_ts is not None:
+        # Drop stale backlog after sleep/resume and very old updates.
+        if msg_ts < runtime.accepted_from_ts:
+            return
+        if (time.time() - msg_ts) > STALE_MESSAGE_MAX_AGE_SECONDS:
+            return
+
+    source_channel_id = int(peer.channel_id)
+    if source_channel_id not in runtime.monitor_ids:
+        return
+
+    feed_chat_id = runtime.feed_chat_id
+    if feed_chat_id is None:
+        return
+
+    if (not bypass_stale_checks) and time.time() < runtime.link_check_blocked_until_ts:
+        _queue_deferred_monitor_message(runtime, msg)
+        return
+
+    chat = await runtime.client.get_entity(PeerChannel(channel_id=source_channel_id))
+    source_username = str(getattr(chat, "username", "") or "").strip() or None
+
+    plain_text = str(getattr(msg, "message", "") or "")
+    raw_entities = list(getattr(msg, "entities", None) or [])
+    bot_entities = _convert_entities_to_bot_api(raw_entities)
+    links = _extract_links(plain_text, raw_entities)
+
     try:
-        msg = event.message
-        if msg is None:
-            return
-        if not isinstance(getattr(msg, "peer_id", None), PeerChannel):
-            return
-
-        msg_date = getattr(msg, "date", None)
-        msg_ts = None
-        if isinstance(msg_date, datetime):
-            if msg_date.tzinfo is None:
-                msg_date = msg_date.replace(tzinfo=timezone.utc)
-            msg_ts = msg_date.timestamp()
-        if msg_ts is not None:
-            # Drop stale backlog after sleep/resume and very old updates.
-            if msg_ts < runtime.accepted_from_ts:
-                return
-            if (time.time() - msg_ts) > STALE_MESSAGE_MAX_AGE_SECONDS:
-                return
-
-        source_channel_id = int(msg.peer_id.channel_id)
-        if source_channel_id not in runtime.monitor_ids:
-            return
-
-        feed_chat_id = runtime.feed_chat_id
-        if feed_chat_id is None:
-            return
-
-        chat = event.chat or await event.get_chat()
-        source_username = str(getattr(chat, "username", "") or "").strip() or None
-
-        plain_text = str(getattr(msg, "message", "") or "")
-        raw_entities = list(getattr(msg, "entities", None) or [])
-        bot_entities = _convert_entities_to_bot_api(raw_entities)
-        links = _extract_links(plain_text, raw_entities)
-
         # If post references its own source channel, skip it entirely.
         for link in links:
             if await _is_same_channel_link_strict(runtime.client, link, source_channel_id, source_username):
@@ -672,35 +782,59 @@ async def _handle_monitor_message(runtime: UserRuntime, event) -> None:
             external_link = candidate
             keyboard = candidate_kb
             break
-        if not external_link:
-            return
-        if keyboard is None:
-            return
-
-        has_photo = getattr(msg, "photo", None) is not None
-        if has_photo:
-            image_bytes = await runtime.client.download_media(msg, file=bytes)
-            if image_bytes:
-                await _enqueue_delivery(
-                    DeliveryJob(
-                        feed_chat_id=feed_chat_id,
-                        text=plain_text or external_link,
-                        entities=bot_entities,
-                        keyboard=keyboard,
-                        photo_bytes=image_bytes,
-                    )
-                )
-                return
-
-        payload_plain = plain_text or external_link
-        await _enqueue_delivery(
-            DeliveryJob(
-                feed_chat_id=feed_chat_id,
-                text=payload_plain,
-                entities=bot_entities,
-                keyboard=keyboard,
-            )
+    except LinkResolutionDeferredError as exc:
+        runtime.link_check_blocked_until_ts = max(
+            runtime.link_check_blocked_until_ts,
+            time.time() + int(exc.retry_after_seconds),
         )
+        _queue_deferred_monitor_message(runtime, msg)
+        return
+
+    if not external_link:
+        return
+    if keyboard is None:
+        return
+
+    dedup_basis = _normalize_post_text_for_dedup(plain_text)
+    dedup_hash = _post_text_hash(dedup_basis)
+    if await get_muted_post_text_service().should_mute(
+        runtime.tg_user_id,
+        dedup_hash,
+        dedup_basis,
+        ttl_days=POST_TEXT_DEDUP_TTL_DAYS,
+    ):
+        return
+
+    has_photo = getattr(msg, "photo", None) is not None
+    if has_photo:
+        image_bytes = await runtime.client.download_media(msg, file=bytes)
+        if image_bytes:
+            await _enqueue_delivery(
+                DeliveryJob(
+                    feed_chat_id=feed_chat_id,
+                    text=plain_text or external_link,
+                    entities=bot_entities,
+                    keyboard=keyboard,
+                    photo_bytes=image_bytes,
+                )
+            )
+            return
+
+    payload_plain = plain_text or external_link
+    await _enqueue_delivery(
+        DeliveryJob(
+            feed_chat_id=feed_chat_id,
+            text=payload_plain,
+            entities=bot_entities,
+            keyboard=keyboard,
+        )
+    )
+
+
+async def _handle_monitor_message(runtime: UserRuntime, event) -> None:
+    try:
+        msg = event.message
+        await _process_monitor_message(runtime, msg, bypass_stale_checks=False)
     except Exception:
         logger.exception("Failed to handle monitor message for user %s", runtime.tg_user_id)
 
@@ -718,6 +852,7 @@ def _attach_monitor_handler(tg_user_id: int, client: TelegramClient) -> None:
         except Exception:
             logger.exception("Failed bootstrap runtime state for user %s", tg_user_id)
         runtime.sync_task = asyncio.create_task(_runtime_sync_loop(runtime))
+        runtime.deferred_task = asyncio.create_task(_deferred_monitor_retry_loop(runtime))
 
     asyncio.create_task(_bootstrap())
 
@@ -832,6 +967,14 @@ async def stop_active_client(tg_user_id: int):
                 pass
             except Exception:
                 logger.exception("Failed stopping runtime sync task for user %s", tg_user_id)
+        if runtime.deferred_task is not None:
+            runtime.deferred_task.cancel()
+            try:
+                await runtime.deferred_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("Failed stopping deferred retry task for user %s", tg_user_id)
         if client is not None and runtime.handler is not None:
             try:
                 client.remove_event_handler(runtime.handler)
@@ -856,6 +999,14 @@ async def logout_userbot_session(tg_user_id: int, session_str: str | None) -> bo
             pass
         except Exception:
             logger.exception("Failed stopping runtime sync task for user %s", tg_user_id)
+    if runtime is not None and runtime.deferred_task is not None:
+        runtime.deferred_task.cancel()
+        try:
+            await runtime.deferred_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Failed stopping deferred retry task for user %s", tg_user_id)
 
     if client:
         try:
